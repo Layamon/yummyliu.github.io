@@ -1,0 +1,145 @@
+---
+layout: post
+title: Basic Paxos & Multi  Paxos
+subtitle: Basic Paxos 里面存在活锁的问题，Paxos假设的环境不包括拜占庭问题
+date: 2015-09-29 22:23
+categories: 
+    - Program
+typora-root-url: ../../layamon.github.io
+---
+
+* TOC
+{:toc}
+# 背景
+
+> **拜占庭将军问题** : 在存在消息丢失的不可靠信道上试图通过消息传递的方式达到一致性是不可能的。因此对一致性的研究一般假设信道是可靠的，或不存在本问题。
+
+**分布式一致性算法考虑的原则**
+
++ safety : 在非拜占庭的情况下，不会返回错误的结果
+
++ available: 在大多数server运行且可以和别的server以及client通信的情况下，系统保证可用
+
++ 不依赖时间来保证一致性，时钟错误，信息延迟会导致可用性不好
+
+一般来说，客户端请求的指令，在大多数server回应之后，可以完成这个指令；保证系统不被小部分server 拖累。
+
+# Basic Paxos
+
+![Basic Paxos 的两阶段](/image/basicpaxos.jpg)
+
+Basic Paxos 中的节点有三个角色：Proposer,Acceptor,Learner；系统达成一致需要两个阶段：
+
+1. 广播Prepare请求，进行投票；
+2. 广播Accept请求，达成一致结果；
+
+## **Proposer**
+
+发送两次请求：
+
+1. Prepare(proposalnumber)
+    该阶段向半数以上的Acceptor发送Prepare请求，发送自己的 proposal number 。
+    
+    一是**value是不是已经选好了，选好了就会得到相应地返回请求，其中有acceptedvalue**；
+    
+    二是**没有选好的话，自己的proposal num大的话就更新acceptor的pn，屏蔽小于其pn的请求**
+    
+2. Accept(proposalnumber,value)
+    将获得的*choosed value*或者*自己的value*发送给服务器,请求服务器接受，前者还好说
+    NOTE:**后者发送自己的value的时候，修改了半数的acceptor的praposal number,但是并没有锁定这些acceptor，仍然可以被更新的praposal抢占，这样发送自己原来的praposql number的时候，由于小于现在的proposal number，会被拒绝，重复下去，这里出现活锁，一种解决方式就是 随机延迟重新启动。**
+
+3. 接收acceptor关于accepted的返回，如果返回的结果中存在minproposalnumber > 当前自己的提案号，则说明自己没有被接受，回到第一步重发prepare请求，否则**value is choosen**
+
+## **Acceptor**
+
+接受两次请求
+
+**Acceptor 记录着最小的Proposal number，acceptedProposalnumber,acceptedvalue**
+
+1. 回应Prepare(proposalnumber),如果该proposalnumber比当前的Proposalnumber大，更新min Proposalnumber;
+始终返回accepted proposal 和 value
+2. 回应accept(n,value),若n不必minproposalnumber小，那么更新 min proposalnumber,acceptednumber,acceptedvalue,始终返回当前的min Proposal number
+![Basic Paxos 的详细过程](/image/2Basicpaxos.jpg)
+
+# Multi Paxos
+
++ Multi Paxos中采用了 Leader election 保证了只有一个Proposer,避免了活锁的问题
++ Basic Paxos中只有Proposer知道 选择了哪个value，如果其他server想知道选择了哪个，那么就得按照paxos协议发起请求。
++ multi paxos 目标是实现复制日志序列；实现的时候我们在Prepare和accept的时候，加上日志记录的序号即可。
+
+场景是 现在有好多的server，每个server上都有一个log序列，由于Multi-paxos发送的Prepare中带有了Index，那么现在acceptor节点上的log序列接受了某个Proposer的Prepare的话，记录下来就呈现如下的形式:
+
+![log in acceptor](/image/log-in-acceptor.jpg)
+
+在Multi-paxos要保证最终的log序列的一致性，某个server接收了Client的一个请求，该server就要执行一致性算法，确认这个请求在log中最终的偏移。
+
+##Multi-paxos中考虑的几个问题：
+
+#### 首先就是如何确定一个client请求的log entry,(在log中位置)
+
+找到该server第一个没有被选中的log entry，则用这个log entry的Index发送Basic Paxos Prepare请求，如果返回了某个acceptedvalue，那么重复，否则选择当前的client commond
+
+#### Improving Efficiency
+
+使用Basic Paxos的低效点：
+
++ 存在很并发的Proposers,more conflicts 和 restart
++ 对于每个value，都有两轮RPCs(Prepare,Accept)
+
+解决方案：
++ 选一个leader,同一时刻只有一个Proposer
++ 减少 Prepare RPCs: 一次Prepare一整个log
+
+#### Leader Election
+
+Lamport提出的一个简单的方案：
+
++ Id最大的server作为leader
++ 每个server每隔Tms向其他server发送heartbeat
++ 如果一个server在2T的时间内，没有收到leader的heartbeat,它就变成leader：
+    - 接受clients的请求
+    - 同时作为Proposer和acceptor
++ 对于不是leader的server：
+    - 拒收clients的请求（转发给leader）
+    - 只作为acceptor
+
+#### Eliminating Prepares
+
+leader发送prepare请求,proposal number refer to the entire log,除了会获得当前entry的highest proposal number，如果log中的任何entry在这之前都没有人提案(除了一些特殊情况，然而现在系统中只有一个leader，怎么还会有别人提案呢)，那么会获得一个 nomoreaccepted的返回；
+某个acceptor给了nomoreaccepted的回复之后，后续对这个acceptor的Prepare请求就可以跳过了。
+一旦leader从**大多数**的acceptor获得了noMoreAccepted的请求,那么就不用发Prepare了，这样 **only 1 round of RPCs needed per log entry (Accepts)**
+
+#### Full Disclosure
+
+信息还没完全完成:
+
++ log entry还未在server间完全复制
++ 只有Proposer知道哪些entry已经被选中
+
+1. keep retrying Accept RPCs ，直到所有的acceptor返回，完全复制大多数的entry
+2. 标记已经被选中的log entry，使其acceptedProposal为 无穷大，并且每个server维护一个 **firstUnchosenIndex**变量
+3. Proposer在Accept RPC请求中带上自己的 firstUnchoosedIndex，告知acceptor已经自己的log entry中被选中的entry；
+acceptor 查找自己的**log中小于firstUnchoosedInde**x的log entry中,**acceptedProposal 等于request.proposal**的,将其mark为choosed（无穷大）。
+
+这样，acceptor能够得知大多说已经被选中的entry,见下图：
+
+![](/image/firsiunchoosedentry.jpg)
+
+4.Proposer接收的Accept返回值中，加上acceptor的firstunchoosedindex，如果proposer.fist~ > acceptor.first~ 那么就在后台发送Success RPC
+Success(index,v),如果需要会发送很多次
+
+#### Client Protocol
+
+起初不知道是哪个server是leader，随便发一个，如果不是，会redirect
+leader 直到这个command的log entry选好了，并且已经被leader的state machine执行了
+
+#### Configuration Changes
+
+serverId,address,数量的变化;特别是数量的变化
+
+Paxos同样也是使用log来存储config的一致，同时定义一个系统相关的变量a，config发生变化后，需要等待a个log entry之后，才能使用新的config
+Note: a 限制了系统的并发度,因为决定i+a的是否choosen，使用的是i处的config,然而i处的config还没决定好是否choosen
+
+# 参考
+
+[Paxos lecture](https://www.youtube.com/watch?v=JEpsBg0AO6o)

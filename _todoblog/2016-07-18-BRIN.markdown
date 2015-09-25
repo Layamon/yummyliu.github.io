@@ -1,0 +1,201 @@
+---
+layout: post
+title: BRIN索引
+date: 2016-07-13 15:04
+header-img: "img/head.jpg"
+categories: 
+    - DBMS
+typora-root-url: ../../layamon.github.io
+---
+
+#### 例子比较,和Btree
+
++ btree
+![btree](/image/B-tree.svg.png)
++ brin
+![brin](/image/BRIN_index.svg.png)
+
+##### 创建索引时间
+
+``` sql
+testdb=# CREATE TABLE brin_example AS SELECT generate_series(1,100000000) AS id;
+SELECT 100000000
+testdb=# \timing
+Timing is on.
+testdb=# CREATE INDEX btree_index ON brin_example(id);
+CREATE INDEX
+Time: 283291.174 ms
+testdb=# CREATE INDEX brin_index ON brin_example USING brin(id);
+CREATE INDEX
+Time: 45454.265 ms
+testdb=# CREATE INDEX brin_index_64 ON brin_example USING brin(id)
+testdb-#     WITH (pages_per_range = 64);
+CREATE INDEX
+Time: 45429.848 ms
+testdb=# CREATE INDEX brin_index_256 ON brin_example USING brin(id)
+testdb-#    WITH (pages_per_range = 256);
+CREATE INDEX
+Time: 45193.891 ms
+```
+
+由于brin可以看出,要写的index索引项少，建索引的时间就大大减少,默认是128个block  
+可以发现随着page_per_range的变化，建索引的时间并没什么变化 ??? 
+
+##### 索引大小
+
+``` sql
+testdb=# SELECT relname, pg_size_pretty(pg_relation_size(oid))
+testdb-#     FROM pg_class WHERE relname LIKE 'brin_%' OR
+testdb-#          relname = 'btree_index' ORDER BY pg_size_pretty;
+    relname     | pg_size_pretty
+----------------+----------------
+ btree_index    | 2142 MB
+ brin_index_256 | 64 kB
+ brin_index     | 104 kB
+ brin_index_64  | 192 kB
+ brin_index_32  | 368 kB
+(6 rows)
+```
+
+可以看出btree大小明显比brin大，并且brin的大小随pg_page_size变大而变小
+
+##### 执行时间
+
+``` sql
+tdb=# EXPLAIN ANALYZE SELECT id FROM brin_example WHERE id = 52342323;
+                                                          QUERY PLAN
+
+--------------------------------------------------------------------------------------------------
+-----------------------------
+ Index Only Scan using btree_index on brin_example  (cost=0.57..8.59 rows=1 width=4) (actual time=
+0.165..0.168 rows=1 loops=1)
+   Index Cond: (id = 52342323)
+   Heap Fetches: 1
+ Planning time: 0.836 ms
+ Execution time: 11.158 ms
+(5 rows)
+testdb=# EXPLAIN ANALYZE SELECT id FROM brin_example WHERE id = 52342323;
+                                                        QUERY PLAN
+
+--------------------------------------------------------------------------------------------------
+-------------------------
+ Bitmap Heap Scan on brin_example  (cost=32.01..36.02 rows=1 width=4) (actual time=34.652..47.400
+rows=1 loops=1)
+   Recheck Cond: (id = 52342323)
+   Rows Removed by Index Recheck: 57855
+   Heap Blocks: lossy=256
+   ->  Bitmap Index Scan on brin_index_256  (cost=0.00..32.01 rows=1 width=0) (actual time=4.618..
+4.618 rows=2560 loops=1)
+         Index Cond: (id = 52342323)
+ Planning time: 0.199 ms
+ Execution time: 47.477 ms
+(8 rows)
+testdb=# EXPLAIN ANALYZE SELECT id FROM brin_example WHERE id > 1000 AND id < 100000;
+                                                                 QUERY PLAN
+
+--------------------------------------------------------------------------------------------------
+------------------------------------------
+ Index Only Scan using btree_index on brin_example  (cost=0.57..3369.89 rows=95066 width=4) (actua
+l time=0.117..135.137 rows=98999 loops=1)
+   Index Cond: ((id > 1000) AND (id < 100000))
+   Heap Fetches: 98999
+ Planning time: 0.976 ms
+ Execution time: 150.637 ms
+(5 rows)
+testdb=# EXPLAIN ANALYZE SELECT id FROM brin_example WHERE id > 1000 AND id < 100000;
+                                                           QUERY PLAN
+
+--------------------------------------------------------------------------------------------------
+------------------------------
+ Bitmap Heap Scan on brin_example  (cost=886.71..212087.04 rows=83387 width=4) (actual time=5.852.
+.106.002 rows=98999 loops=1)
+   Recheck Cond: ((id > 1000) AND (id < 100000))
+   Rows Removed by Index Recheck: 16713
+   Heap Blocks: lossy=512
+   ->  Bitmap Index Scan on brin_index_256  (cost=0.00..865.87 rows=83387 width=0) (actual time=5.
+117..5.117 rows=5120 loops=1)
+         Index Cond: ((id > 1000) AND (id < 100000))
+ Planning time: 0.463 ms
+ Execution time: 119.673 ms
+(8 rows)
+```
+
+可以看出在精准查询的时候使用Btree好，在返回结果较多的范围查询使用BRIN好   
+现在能得出这样简单结论，下面结合Block具体存储结构来说
+
+#### Block Range Index 简述
+
+面向极大表的索引，提高访问性能，有点像orcfile中的minmax index  
+postgresql9.5首次也是唯一一个数据库支持BRIN INDEX(来自维基百科)  
+一个block range 就是table中的一组page,这些page物理上是相邻的，  
+对于每个block range,index中存下了一些统计信息。比如最大值，最小值
+
+BRIN INDEX 能够通过bitmap index scan 进行查询，将每个summary tuple和query quals比较；  
+所有满足的range将返回其包含的page，构成一个不准确的bitmap，完成一次初步过滤。
+
+一般来说，使用BRINindex来scan，就是混合使用index scan和seq scan。  
+block range大小由一个参数（pages_per_range）决定,可以在创建索引的时候使用with来指定   
+每次返回一批包含结果的page，然后再进行scan过滤
+而不像是BTREE，每个值都被索引了,index scan就直接找到结果
+
+#### Block Range Index 结构
+
+一个BRIN索引由三部分结构组成：meta page，revmap page和regular page。
+通过pageinspect提供的查询函数，我们可以知道brin对应的索引文件结构
+##### Meta Page
+
+``` sql
+test=# SELECT * FROM brin_metapage_info(get_raw_page('brinidx', 0));
+   magic    | version | pagesperrange | lastrevmappage 
+------------+---------+---------------+----------------
+ 0xA8109CFA |       1 |             4 |              2
+```
+
+1. Metapage的Magic Number；
+2. BRIN索引的版本号
+3. 这个BRIN索引的pages_per_range设置
+4. 最后一个revmap page的位置。PG中，page的编号从0开始；
+
+##### revmap page
+
+``` sql
+test=# SELECT * FROM brin_revmap_data(get_raw_page('brinidx', 2)) limit 5;
+  pages  
+---------
+ (6,137)
+ (6,138)
+ (6,139)
+ (6,140)
+ (6,141)
+```
+
+（regular page id, heap page）记下后面的regular page都存了哪些heap page  
+
+这里为什么加上一个revmapage ? (个人推测，待验证)
+如果没有revmapage，通过regular page中的统计信息同样可以过滤出满足条件的heap page   
+但是找到合适的head page需要顺序扫描全部的regular page   
+而实际上,所有的regular page按照物理顺序的存储索引heap page    
+而在,在revmap page中，regular page的顺序是按照列的大小顺序来存储  
+这样，多了排序这一个信息，查找的时候可以使用二分等方法，比起全表搜会快些
+
+##### regular page
+
+``` sql
+test=# SELECT * FROM brin_page_items(get_raw_page('brinidx', 5),
+                                     'brinidx')
+       ORDER BY blknum, attnum LIMIT 6;
+ itemoffset | blknum | attnum | allnulls | hasnulls | placeholder |    value     
+------------+--------+--------+----------+----------+-------------+--------------
+        137 |      0 |      1 | t        | f        | f           | 
+        137 |      0 |      2 | f        | f        | f           | {1 .. 88}
+        138 |      4 |      1 | t        | f        | f           | 
+        138 |      4 |      2 | f        | f        | f           | {89 .. 176}
+        139 |      8 |      1 | t        | f        | f           | 
+        139 |      8 |      2 | f        | f        | f           | {177 .. 264}
+```
+
+value : 中就是比较信息，最小值最大值  
+blknum : 是一个索引条目的起始heappage编号。  
+attnum: 是指一个条目中存放的是第几个字段的信息。
+allnulls: 是告诉我们在一个条目涵盖的128个heap page对应的索引字段上是否全部为NULL值。  
+hasnulls : 告诉我们在一个条目涵盖的128个heap page对应的索引字段上是否含有NULL值。

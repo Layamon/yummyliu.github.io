@@ -1,0 +1,33 @@
+---
+layout: post
+title: From Btree To LSM-tree
+date: 2019-12-10 11:21
+categories:
+  - datastruct
+  - Database
+typora-root-url: ../../layamon.github.io
+---
+
+> 两年前对LSM-tree只有一个初步的认识；回过头一看，很多认识还不够，重写此文。
+
+Btree和LSM-tree是存储引擎中经典的两种存储架构，关于两者的八股文也不少，原先的本文更是一个两者八股的融合；而今看着很粗鄙，而希望现在能基于自己的经历，给出自己的认识。
+
+首先，存储引擎（本文特指单机存储引擎）的设计离不开三种放大的讨论，这就是RUM 猜想；在RUM中，一个存储引擎不能同时在read、write、storage三个方面达到最优，必然要有所取舍；而Btree选择了Read，LSM-tree选择了Write。
+
+这里三方面的指标通常是指放大系数：
+
+对于读放大，就是IO per query；没有Cache的之下，理想上应一次IO返回数据，但是存在多层索引的情况下，往往需要多次IO。优化读最简单的优化方式就是增加Cache，但是读的优化更重要是关注在**长尾优化**，因为只要你索引的层高在那摆着，永远会有读会穿透到最底层。Btree是通过增大扇出数，从而减少了层高；同样的，在LSM-tree中，也可以增大层间扇出数，减少层高，但是会带来更大的后台写放大；另外，还有通过filter、metadata进行读IO过滤；LSM-tree中关于读的优化，基本都是不够彻底，P99或者Pmax还是会有长尾。
+
+对于写放大，就是DataWriteIntoStorage / DataWriteIntoDatabase；理想情况下，我向DB内写了N bytes的数据，DB向Disk也写N bytes的数据；但实际上，我们为了管理数据， 还需要写Meta、Index、Checksum等等其他数据。首先，这里关注的写放大只关注说了高优的用户前台写，LSM-tree在此维度取得的优势也是来自前台写，因为Btree必须按块落盘，写一个entry也是，LSM-tree则不需要；但是DB的写不仅仅发生在前台，后续很多维护操作（PgSQL的Vacuum、MySQL的Purge以及RocksDB的Compact）对磁盘的反复倒腾也不可忽略的；如果考虑上这个，在这一项上Btree和LSM-tree也不一定就孰优孰劣。不过两者在写放大上的优化手段都是类似的：
+
+- 优化前台可以采用**合并写**（Write consolidation），充分利用Disk的带宽；Btree模型的BufferPool，写日志的GroupCommit以及RocksDB的WriteBatch都是这个道理；
+
+- 优化后台写就是尽量减小**数据重组**（data reorganization），减少数据的重复搬运；在Inplace-Update的Btree中，比如InnoDB，相对来说其后台的数据搬运量不太多；数据搬运主要出现在多版本混合存储中，在LSM-tree中天然就是这样，所以Compaction问题很明显；但是在Btree类型中，PostgreSQL同样是将多版本混合存储在Heap中，因此其Vacuum进程同样成为其不可避开的问题，不过Vacuum的数据搬运工作都是集中在单个Page内部的整理，这样secondary index只需要一直保留ctid(pageid+tupleid)即可；对于LSM-tree，减少数据搬运，可通过数据复用来解决，比如在Xengine中将LSMtree基于固定大小extent来管理，在Compaction中可尽量复用non-overlap的extent；但是数据数据复用一般需要一个额外的MetaIndex部分，而解决数据搬运最直接的办法就是一次将其搬运到其最终位置上（InplaceUpdate天然就是这样，因此Btree这个问题比较少），在LSM-tree就是最后一层，因此采用tier（universal）compaction strategy能够减少写放大，比如ScyllaDB。
+
+对于空间放大，就是DataSizeInStorage / DataSizeInDatabase；理想情况下，我总共写了N bytes的数据，Disk最终应该也只用了N bytes的空间；和写放大同理，我们还需要存储额外的信息；另外空间放大最重要的还有**无效数据空间**占用，常说的就是多版本和已删除的数据的清理；通常来说，Btree是InplaceUpdate虽然不会存储所有版本，到那时Page内部会有碎片；LSM-tree的SST是read-only且有序紧密排布不存在碎片浪费，这是LSM-tree不可忽略的优势。另外LSM-tree的SST可以使用前缀压缩等按条目压缩算法，效果比块压缩好，但是压缩好对应着解压代价高，有进一步拉低了读方面的能力。
+
+以上简单介绍了存储引擎设计时考虑的维度；另外存储引擎如何才能跑得好，和底层硬件特性更是密不可分；为什么Btree在传统DB中能够得到普遍应用，其中很重要的原因就是HDD读起来实在太慢了，Btree的多路平衡树能够比较好的保证稳定且少量的IO次数；而现在企业场景下，SSD被广泛应用，虽然其在随机读写上的性能上去了，但是SSD更多考虑的是磨损均衡、内部GC效率等问题，整盘的随机读写会加剧这些问题，这使得Append-Only的存储模型能够发挥很好的用处，由此LSM-tree也得以发光发热，并且在Btree体系中的Bwtree也获得了很高的关注度。
+
+不过这并不代表传统Btree已经日薄西山了，作为数据库更多的应该解决用户问题，LSM-tree的广泛应用我认为还有一个原因就是，在大数据的时代背景下，OLAP的性能要求。
+
+Btree架构的传统DB，在其问世的时候，是为了解决OLTP问题出现的。底层的Page内部存储了完整的行，以及Page内部对行索引。OLAP的发展推动了列存类型存储引擎的发展，OLAP的特点的大量的读IO并且集中在某几列中；Btree倒也不是不能存Column，但是其存储不够紧凑，这会导致盘内大量的随机IO。因此，现在惯用的列存解决方案就是先将Table水平划分为多个segment，每个segment再按列划分为多个columnfamily（RocksDB之ColumnFamily），在每个Columnfamily中，则可以根据数据类型的不同，选择不同的索引和压缩算法；而Btree依然还是OLTP服务的最佳选择，像现在流行的概念HTAP中，存储模型还是将TP和AP的数据分开放，没有一个完美的银弹。

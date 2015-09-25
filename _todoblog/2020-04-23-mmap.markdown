@@ -1,0 +1,182 @@
+---
+layout: post
+title: mmap与page cache
+date: 2020-04-23 15:04
+categories:
+  - Linux
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+# Page Cache
+
+四类page：
+
++ 读取mmap的文件时，发生page fault后加载的page；
++ 按Block读取块设备或filesys时，加载的buffer page；
++ page cache中的特别区域——swap cache的Anonymous page；
++ shared-memory中的page。
+
+Page Cache构成
+
++ **inode queue**：包含三个list，
+
+  + clean_pages
+  + dirty_pages
+  + locked_pages
+
++ **page cache hash table**：mm/filemap.c `struct page **page_hash_table`
+
++ **LRU lists**：包含两个list（mm/page_alloc.c）：
+
+  + (hot)active_list：
+  + (cold)inactive_list
+
+  有pagemap_lru_lock这个自旋锁控制并发；通过`refill_inactive`将active list中的page转移到inactive list中，保持active list是inactive list的2/3。
+
+  ![img](/image/mmap/inactive-active-lists.png)
+
+## 回收内存
+
+shrink_cache负责释放一些内存空间，区别于上面的shrink_cache，shink_caches包含若干步，shrink_cache只是其中一步：
+
+1. kmem_cache_reap
+2. refill_inactive
+3. shrink_cache
+   1. swap_out
+4. shrink_dcache_memory
+5. shrink_icache_memory: Instructions and data have different access patterns.
+6. shrink_dqcache_memory
+
+swap out交给专门的守护进程——kswapd执行，一旦系统的free page数量小于pages_low，该进程就开始swap out。
+
+> **kswapd**的换出是单线程的，可能成为buffer io写出的瓶颈。
+>
+> The limitation is there so that if **kswapd** schedules a large number of pages to be written to disk, it will sleep occasionally to allow the IO to take place. As pages are freed, `nr_pages` is decremented to keep count.
+>
+> 2.6之后，对于系统的[每个memory node都有一个kswapd]([https://www.kernel.org/doc/gorman/html/understand/understand005.html#new:%20Describing%20Physical%20Memory](https://www.kernel.org/doc/gorman/html/understand/understand005.html#new: Describing Physical Memory))
+
+# madvise
+
+
+
+
+
+
+
+# THP
+
+> 4KB is an increase over what early virtual memory systems used; 512 bytes was once common. But it is still small relative to the both the amount of physical memory available on contemporary systems and the working set size of applications running on those systems. That means that the operating system has more pages to manage than it did some years back.
+
+Benefit
+
++ the size of page tables decreases, as does the number of page faults required to get an application into RAM.  (decreasing page fault counts)
+
++ fewer translation lookaside buffer (TLB) slots
+
+Drawback
+
++ internal fragmentation
++ high sparsely-accessed memory cost
++ increasing page fault latency
+
+
+
+
+
+https://lwn.net/Articles/359158/
+
+![img](/image/cpu/northbridge.png)
+
+
+
+**interrupt request line**
+
+ During the [boot process](https://manybutfinite.com/post/kernel-boot-process) the kernel programs a hardware timer to issue **timer interrupts** at a periodic interval,
+
+https://manybutfinite.com/post/when-does-your-os-run/
+
+**Interrupts are the most frequent and crucial entry point into the OS kernel.**
+
+**interrupts**
+
+​	timer **interrupts**
+
+​	+ int overflow
+
+​	+ page fault
+
+**ticks**
+
+
+
+
+
+https://manybutfinite.com/post/cpu-rings-privilege-and-protection/
+
+
+
+
+
+![Flexible Process Address Space Layout In Linux](/image/cpu/linuxFlexibleAddressSpaceLayout.png)
+
+
+
+Memory mapping is a convenient and high-performance way to do file I/O, so it is used for loading dynamic libraries. It is also possible to create an **anonymous memory mapping** that does not correspond to any files, being used instead for program data. In Linux, if you request a large block of memory via [malloc()](http://www.kernel.org/doc/man-pages/online/pages/man3/malloc.3.html), the C library will create such an anonymous mapping instead of using heap memory.
+
+```
+Compaction(snaps, files):
+// <snaps> is the set of snapshots (i.e.: a list of sequence numbers)
+// <files> is the set of files undergoing compaction
+Let input = a file composed of the union of all files
+Let output = a file to store the resulting entries
+
+Let stack = [];			// in reality, this should be a "deque", but stack is simpler to conceptualize in this pseudo-code
+for each v from newest to oldest in input:
+ clear_stack = false
+ if v.sequence_number is in snaps:
+   clear_stack = true
+ else if stack not empty && v.key != stack.top.key:
+   clear_stack = true
+
+ if clear_stack:
+   write out all operands on stack to output (in the same order as encountered)
+   clear(stack)
+
+ if v.type is "merge_operand":
+   push v to stack
+     while (stack has at least 2 elements and (stack.top and stack.second_from_top can be partial-merged)):
+       v1 = stack.pop();
+       v2 = stack.pop();
+       result_v = client_merge_operator.PartialMerge(v1,v2)
+       push result_v to stack
+ if v.type is "put":
+   write client_merge_operator.FullMerge(v, stack) to output
+   clear stack
+ if v.type is "delete":
+   write client_merge_operator.FullMerge(nullptr, stack) to output
+   clear stack
+
+If stack not empty:
+ if end-of-key-history for key on stack:
+   write client_merge_operator.FullMerge(nullptr, stack) to output
+   clear(stack)
+ else
+   write out all operands on stack to output
+   clear(stack)
+
+return output
+```
+
+
+
+
+
+**M_MMAP_THRESHOLD**
+
+For allocations greater than or equal to the limit specified (in bytes) by **M_MMAP_THRESHOLD** that can't be satisfied from the free list, the memory-allocation functions employ **[mmap](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/mmap.2.html)**(2) instead of increasing the program break using **[sbrk](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/sbrk.2.html)**(2).
+
+
+
+Allocating memory using **[mmap](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/mmap.2.html)**(2) has the significant advantage that the allocated memory blocks can always be independently released back to the system. (By contrast, the heap can be trimmed only if memory is freed at the top end.) On the other hand, there are some disadvantages to the use of **[mmap](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/mmap.2.html)**(2): deallocated space is not placed on the free list for reuse by later allocations; memory may be wasted because **[mmap](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/mmap.2.html)**(2) allocations must be page-aligned; and the kernel must perform the expensive task of zeroing out memory allocated via **[mmap](dfile:///Users/bytedance/Library/Application Support/Dash/User Contributed/Linux Man Pages/Linux.docset/Contents/Resources/Documents/man2/mmap.2.html)**(2). Balancing these factors leads to a default setting of 128*1024 for the **M_MMAP_THRESHOLD**parameter.

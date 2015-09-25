@@ -1,0 +1,42 @@
+---
+layout: post
+title: 
+date: 2021-07-12 13:02
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+# BwTree
+
+构建一个lock-free的index，通常借助于cas操作；然而cas一次只能更新一个地址内容，对于Btree存在prev/next指针的情况，无法通过cas完成原子的变更；而skiplist只有一个next指针实现lockfree就相对容易些。为了实现B+tree是的lock-free，微软的一次hackathon上有人提出了一个bwtree的想法。bwtree通过引入一个中间层（MapTable）这样可以通过一次cas完成page的替换。
+
+Bwtree基于以下两个想法：
+
+1. Map Table
+2. Delta
+
+## MapTable
+
+每个Page被赋予一个pageid，pageid替代原来的pageptr来表示b+tree的结构；MapTable中维护了<pageid, pageptr>的关系。
+
+## Delta
+
+某个Pageid更新的时候：
+
+1. 查询MapTable得到当前的pageptr；
+2. 生成一个指向pageptr的DeltaRecord；
+3. **cas install**map table的pageid所在的entry，为<pageid, Deltarecord_ptr>；
+
+当存在并发更新时，cas install只会成功一个；后续会基于新地址cas。
+
+### Consolidation
+
+当一个base page之后的delta达到一定程度后，就执行Consolidation操作（Apply delta record and instal new pageptr）；
+
+## GC
+
+对于旧的Page通过epoch方式的GC回收（similar like RCU in linux os）。
+
+[cmu-db-index](https://15721.courses.cs.cmu.edu/spring2019/slides/07-oltpindexes1.pdf)

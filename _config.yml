@@ -1,0 +1,50 @@
+# Site settings
+title: SELECT * FROM LiuYangming;
+description: "open up the wasteland of brain"
+author: Yangming's Blog
+subtitle: table yangming;
+email: sdwhlym@gmail.com
+logo_location: "/image/sar.png"
+
+github: https://github.com/layamon
+about: beware the barrenness of a busy life
+#disqus_shortname: layamon
+disqus_shortname: yummyliu
+google_analytics: UA-80816254-1
+
+enableTags: true
+tagarray: []
+
+social:
+    - icon: fa-weibo
+      link: "https://weibo.com/yummmyliu"
+    - icon: fa-linkedin
+      link: "https://www.linkedin.com/in/yangming-liu-a0720ab7/"
+#    - icon: fa-github
+#      link: "https://github.com/layamon"
+
+urls:
+    - text: About Me
+      url: /about/
+
+url: "https://liuyangming.tech"
+baseurl: ""
+paginate: 20
+per_page: 20
+paginate_path: "/page/:num/"
+markdown: kramdown
+highlighter: rouge
+gems:
+  - jekyll-paginate
+  - jekyll-gist
+
+compress_html:
+  clippings: all
+  comments: ["<!-- ", " -->"]
+  endings: all
+  ignore:
+    envs: ['development']
+#baseurl: "" # the subpath of your site, e.g. /blog/
+url: "" # the base hostname & protocol for your site
+permalink:        /:month-:year/:title:output_ext
+#agusmakmun.github.io/

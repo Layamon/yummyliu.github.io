@@ -1,0 +1,71 @@
+---
+layout: post
+title: 
+date: 2021-07-31 12:24
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+
+
+text就是代码段。对于代码段，我们需要了解代码是如何从code到机器指令的？如[下图](https://www3.ntu.edu.sg/home/ehchua/programming/cpp/gcc_make.html)所示，中间有4个步骤：
+
+1. **Preprocessor**：宏展开，引用头文件；
+2. **Compiler**：源代码转成目标CPU的汇编代码；
+3. **Assembler**：将汇编代码转成二进制代码文件；
+4. **Linker**：将多个目标文件和库文件进行链接，生成一整个可执行文件（注意这里的库文件分为静态库和动态库）。
+
+![img](../image/cpp-memo/GCC_CompilationProcess.png)
+
+其中在第4步中，如果是静态库那么每个可执行文件中都会有一个静态库的代码拷贝。这样最终的可执行文件就会比较臃肿；因此，提出了另一个动态（共享）库的链接方式；具体调用的时候需要对函数入口进行**相对寻址**，这样效率上比静态库可能会慢一些；
+
+在Linux中，比如libc.so就是一个常用的动态库，该动态库被系统大多数进程共享使用。在链接过程中，可执行文件中会创建一个**符号映射表**。在app执行的时候，OS将控制权先给`ld.so`，而不是先给app。`ld.so`会找到并引入lib；然后将控制权转给app。通过以下命令，可看到ld搜索库文件的路径。
+
+```bash
+# ld --verbose | grep SEARCH_DIR | tr -s ' ;' \\012
+SEARCH_DIR("=/usr/x86_64-redhat-linux/lib64")
+SEARCH_DIR("=/usr/lib64")
+SEARCH_DIR("=/usr/local/lib64")
+SEARCH_DIR("=/lib64")
+SEARCH_DIR("=/usr/x86_64-redhat-linux/lib")
+SEARCH_DIR("=/usr/local/lib")
+SEARCH_DIR("=/lib")
+SEARCH_DIR("=/usr/lib")
+```
+
+> *NOTE1*：在写MakeFile的时候，常常在文件中定义了`LDFLAGS`变量(描述定义了使用了哪些库，以及相应的参数)。但是最后连接的时候，将`*.o`和`LDFLAGS`进行连接，出现undefine-reference问题，因为库中明明有这些符号，但是却没有找到，奇怪了，原因如下：
+>
+> **在UNIX类型的系统中，编译连接器，当命令行指定了多个目标文件，连接时按照自左向右的顺序来搜索外部函数的定义。也就是说，当所有调用这个函数的目标文件名列出后，再出现包含这个函数定义的目标文件或库文件。否则，就会出现找不到函数的错误，连接是必须将库文件放在引用它的所有目标文件之后**
+
+> *NOTE2*：对于动态库的全局代码段，每个进程维护通过相对寻址来执行。而对于动态库中的非常量全局变量不是共享的，每个进程一个拷贝。
+
+编译选项
+
+- O0：不开优化，调试
+  - Og：加更多调试信息
+- O1（O）：代码块内部的优化；Mem->Register
+- O2：不改变代码结构的前提下，编译单元内部的优化几乎全开。
+  - 向量化：利用CPU支持的向量指令，gcc在O3开启。
+    - -march：指明特定的架构，启用相应架构的向量指令；默认打开mtune，mtune不生成特定代码，但是会针对性的调度执行顺序（乱序）。
+    - 编译器需要预先做内存别名分析，防止内存覆盖，才能启用向量化；这个分析很花时间。
+  - 循环展开：利用CPU的计算部件容易，在流水线中并行处理
+- O3：通过数据流分析，可能会等价变换代码结构，可能暴露程序逻辑问题；
+- Ofast：在O3的基础上，加上-ffast-math，不遵循浮点数IEEE753标准，降低精度，提高执行速度。
+- flto：Link Time Optimize；得到更多的全局信息；
+- PGO：先跑一遍，生成profile文件，在基于profile文件提供的运行时信息进行优化决策，比如
+  - 是否inline
+  - 那个变量应该放在寄存器中
+  - 提高热Code的icache hit。
+- Os：如果关注CodeSize的话。
+
+
+
+
+
+- 
+- --no-as-needed
+- -Wl,--whole-archive：Cmake如何指定某个static lib使用这个option
+- __attribute__((constructor(priority))) : 在main函数执行之前，进行的构造函数的执行顺序定义；

@@ -1,0 +1,33 @@
+---
+layout: post
+title: 
+date: 2020-05-06 13:42
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+https://dev.mysql.com/doc/dev/mysql-server/latest/classTHD.html
+
+sql_class.h
+
+```cpp
+class THD :public MDL_context_owner,
+           public Query_arena,
+           public Open_tables_state
+```
+
+![image-20200506141050371](/../Pictures/image-20200506141050371.png)
+
+
+
+MYSQL_BIN_LOG::process_commit_stage_queue
+
+​	bool all = head->get_transaction()->m_flags.real_commit;
+
+​	ha_commit_low(head, all, false)
+
+
+

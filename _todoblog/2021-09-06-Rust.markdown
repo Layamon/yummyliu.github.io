@@ -1,0 +1,15 @@
+---
+layout: post
+title: 
+date: 2021-09-06 15:28
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+
+Rust的一些不一样的地方
+
+- 变量和参数默认都是Immutable，引用同理；
+- cargo.toml中的版本号用semantic version表示，cargo build的时候会找到最后一个**bugfix相关版本号的最新修改（比如写的是0.8.3，实际有0.8.4，那么会下载0.8.4）**，锁定到cargo.lock中；这样只要cargo.lock存在，那么就可以锁定编译相关的版本，除非使用cargo update进行更新。
+- Rust的Heap Allocated Type默认的赋值行为都是 move（不管是变量赋值，还是参数传递），即，将ownership转移到新变量中；在变量赋值时，只有显示调用.clone()，才是copy；在传参的时候，如果不想转移ownership，使用&引用传递。
+

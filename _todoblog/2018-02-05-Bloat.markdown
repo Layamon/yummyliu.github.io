@@ -1,0 +1,88 @@
+---
+layout: post
+title: 关于PostgreSQL膨胀的三言两语
+date: 2018-02-05 18:07
+header-img: "img/head.jpg"
+categories: 
+    - PostgreSQL
+---
+
+# table bloat
+
+PG的mvcc机制，将旧tuple还是放在堆表中，等待vacuum回收；如果回收不及时，表空间膨胀，浪费磁盘空间，IO速度下降。
+
+## 一些导致表膨胀的原因
+
+1. idle transaction
+
+2. 数据修改的太快了，autovacuum跟不上
+
+   NOTE: `SELECT * FROM pg_stat_sys_tables` 
+
+   ```bash
+   -[ RECORD 4 ]-------+------------------------------
+   relid               | 16616
+   schemaname          | public
+   relname             | pgbench_branches
+   seq_scan            | 17
+   seq_tup_read        | 340000
+   idx_scan            | 6939546
+   idx_tup_fetch       | 6939546
+   n_tup_ins           | 20000
+   n_tup_upd           | 6939546
+   n_tup_del           | 0
+   n_tup_hot_upd       | 6916103
+   n_live_tup          | 20000
+   n_dead_tup          | 0
+   n_mod_since_analyze | 0
+   last_vacuum         | 2018-01-18 03:01:59.895538+00
+   last_autovacuum     | 2018-01-18 03:07:03.268601+00
+   last_analyze        | 2018-01-17 04:30:34.290727+00
+   last_autoanalyze    | 2018-01-18 03:07:03.29821+00
+   vacuum_count        | 17
+   autovacuum_count    | 32
+   analyze_count       | 1
+   autoanalyze_count   | 201
+   ```
+
+3. 网络原因，stats collector进程启动的时候，监听一个UDP端口，系统中每次活动，给这个localhost的端口，发一个udp的socket。stats collector进行收集统计。stats collector收集不到信息，也不会触发vacuum。
+
+   如下，
+
+   ```Bash
+   [postgres@10-9-178-80 ~]$ ps aux | grep postgres
+   root     20776  0.0  0.1 193484  2812 pts/1    S    18:53   0:00 sudo su - postgres
+   root     20777  0.0  0.1 185612  2308 pts/1    S    18:53   0:00 su - postgres
+   postgres 20778  0.0  0.1 115396  2032 pts/1    S    18:53   0:00 -bash
+   postgres 20801  0.0  0.8 389832 16588 pts/1    S    18:53   0:00 /usr/pgsql-10/bin/postgres -D /export/postgresql/test_10/data
+   postgres 20802  0.0  0.1 242644  1932 ?        Ss   18:53   0:00 postgres: logger process
+   postgres 20804  0.0  0.1 389832  2176 ?        Ss   18:53   0:00 postgres: checkpointer process
+   postgres 20805  0.0  0.1 389832  2928 ?        Ss   18:53   0:00 postgres: writer process
+   postgres 20806  0.0  0.3 389832  6356 ?        Ss   18:53   0:00 postgres: wal writer process
+   postgres 20807  0.0  0.1 390412  3208 ?        Ss   18:53   0:00 postgres: autovacuum launcher process
+   postgres 20808  0.0  0.1 244764  2192 ?        Ss   18:53   0:00 postgres: archiver process   failed on 000000010000000000000001
+   postgres 20809  0.0  0.1 246424  3168 ?        Ss   18:53   0:00 postgres: stats collector process
+   postgres 20810  0.0  0.1 390124  2528 ?        Ss   18:53   0:00 postgres: bgworker: logical replication launcher
+   postgres 20842  0.0  0.0 139512  1624 pts/1    R+   18:55   0:00 ps aux
+   postgres 20843  0.0  0.0 112660   968 pts/1    R+   18:55   0:00 grep --color=auto postgres
+   [postgres@10-9-178-80 ~]$ lsof -Pnl +M -i4|grep 20809
+   postgres 20809     1001   10u  IPv4 737209      0t0  UDP 127.0.0.1:39097->127.0.0.1:39097
+   ```
+
+   这里: [tablebloatCauseOFbadnetwork](https://www.cybertec-postgresql.com/en/stale-statistics-cause-table-bloat/)，是因为ipv6 disable导致监听收到信息。
+
+## 判断PG中是否表膨胀
+
+1. 插件——*pgstattuple*、
+2. SQL—— [tablebloattest](https://wiki.postgresql.org/wiki/Show_database_bloat)
+
+## 膨胀后表的瘦身
+
+当发现表膨胀了，可以通过一些措施来将表进行瘦身。
+
+1. VACUUM FULL; 回收，加exclusive锁
+2. `CLUSTER index_name ON table_name`； 按照某个索引聚簇，加exclusive锁
+3. pg_squeeze; a background-worker process，解析redo日志，利用逻辑复制实现。设定一个阈值，可以自动瘦身。
+   + 不用加锁
+   + 可以自动瘦身
+   + 以扩展的形式运行一个background-worker

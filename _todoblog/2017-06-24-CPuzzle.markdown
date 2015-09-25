@@ -1,0 +1,74 @@
+---
+layout: post
+title: C & Linux API Puzzle
+date: 2017-06-24 07:41
+header-img: "img/head.jpg"
+categories: 
+  - C
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+# 宏内多行语句的编辑
+
+```c
+#define FOO(X) do { f(X); g(X); } while (0)
+#define FOO(X) if (1) { f(X); g(X); } else
+```
+
+# 可重入与线程安全
+
+若一个程序或子程序可以“在任意时刻被中断，然后操作系统调度执行另外一段代码，这段代码又调用了该子程序，而不会出错”，则称其为**可重入**（reentrant或re-entrant）。要求函数中的变量都保存在当前函数栈中，可重入函数主要是强调单线程执行时的中断可重入。
+
+线程安全是指多线程环境下，可以正确的处理函数的共享变脸。
+
+> wikipieda
+>
+> 在下面这段代码中，函数increment_counter是线程安全的，但不是[可重入](https://zh.wikipedia.org/wiki/%E5%8F%AF%E9%87%8D%E5%85%A5)的。
+>
+> ```c
+> #include <pthread.h>
+> 
+> int increment_counter ()
+> {
+> 	static int counter = 0;
+> 	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+> 
+> 	pthread_mutex_lock(&mutex);
+> 	
+> 	// only allow one thread to increment at a time
+> 	++counter;
+> 	// store value before any other threads increment it further
+> 	int result = counter;	
+> 
+> 	pthread_mutex_unlock(&mutex);
+> 	
+> 	return result;
+> }
+> ```
+>
+> 上面的代码中，函数increment_counter可以在多个线程中被调用，因为有一个互斥锁mutex来同步对共享变量counter的访问。但是如果这个函数用在可重入的中断处理程序中，如果在pthread_mutex_lock(&mutex)和pthread_mutex_unlock(&mutex)之间产生另一个调用函数increment_counter的中断，则会第二次执行此函数，此时由于mutex已被lock，函数会在pthread_mutex_lock(&mutex)处阻塞，并且由于mutex没有机会被unlock，阻塞会永远持续下去。简言之，问题在于 [pthread](https://zh.wikipedia.org/wiki/Pthread) 的 mutex 不可重入。
+>
+> 解决办法是设定 PTHREAD_MUTEX_RECURSIVE 属性。然而对于给出的问题而言，专门使用一个 mutex 来保护一次简单的增量操作显然过于昂贵，因此[c++11](https://zh.wikipedia.org/wiki/C%2B%2B11)中的[原子变量](https://zh.wikipedia.org/w/index.php?title=Atomic_(C%2B%2B%E6%A0%87%E5%87%86%E5%BA%93)&action=edit&redlink=1)提供了一个可使此函数既线程安全又可重入（而且还更简洁）的替代方案：
+>
+> ```c
+> #include <atomic>
+> 
+> int increment_counter ()
+> {
+> 	static std::atomic<int> counter(0);
+> 	
+> 	// increment is guaranteed to be done atomically
+> 	int result = ++counter;
+> 
+> 	return result;
+> }
+> ```
+
+# 内存泄露检查工具
+
+http://elinux.org/Memory_Debuggers
+
+
+
+Constexpr  define const

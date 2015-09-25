@@ -1,0 +1,41 @@
+---
+layout: post
+title: 
+date: 2020-05-25 13:45
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+- 
+
+
+
+
+
+```cpp
+enum FileType {
+  kLogFile,  // wal
+  kDBLockFile,
+  kTableFile, // SST file (有个FileDescriptor头就可以读了，不管具体格式)
+  kDescriptorFile, // MANIFEST
+  kCurrentFile, // CURRENT
+  kTempFile,
+  kInfoLogFile,  // Either the current one, or an old one
+  kMetaDatabase,
+  kIdentityFile, // 记一个UUID
+  kOptionsFile,
+  kBlobFile,
+  kSocketFile
+};
+```
+
+
+
+repair
+
+- Find files：repair时只关注 kDescriptorFile、kTableFile、kLogFile
+- Convert logs to tables：replay有效的log，
+- Extract metadata：扫描每个表，获取每个表的元信息，并更新全局元信息（last seq)
+- Write Descriptor：

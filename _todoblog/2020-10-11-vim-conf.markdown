@@ -1,0 +1,82 @@
+---
+layout: post
+title: 玩转VIM
+date: 2020-10-11 15:56
+categories:
+  - others
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+笔者最初入门计算机，上C语言实验课的时候使用的是Turbo C编辑器，后来学C++又使用了VC6.0，然后学Java有用了Eclipse...
+
+<img src="https://beginnersbook.com/wp-content/uploads/2014/01/first-C-program.png" alt="How to install Turbo C++: Compile and Run a C Program" style="zoom:75%;" />
+
+最后，受到师兄的启发，开始会用Vim编辑器；自此入了这个大坑。Vim的可玩性很好，这同样也是一大弊端；因为有时甚至会写着代码突然觉得某个操作不得劲，就开始找插件；一般都能找到，而且还会找到很多，但是！！！在这个过程中，原先要写的代码的时间就耽误了(⊙︿⊙)。为了给这些浪费的时间一个胶带，整理此文并且也会持续更新。
+
+# 安装依赖
+
+## Python3
+
+很多插件需要vim打开python3选项，那么首先系统得安装Python3，这里使用pyenv来管理python版本。
+
+```bash
+curl https://pyenv.run | bash
+echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.zshrc
+echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.zshrc
+pyenv init
+env PYTHON_CONFIGURE_OPTS="--enable-framework CC=clang" pyenv install 3.6.12
+pyenv local 3.6.12
+```
+
+> 注意清理无效的python软连接
+>
+> ```bash
+> brew doctor
+> brew cleanup
+> ```
+
+# 安装Vim
+
+既然是用Vim，出于可玩性考虑，推荐直接clone代码，紧跟master。
+
+```bash
+git clone https://github.com/vim/vim.git
+
+./configure --with-features=huge \
+            --enable-multibyte \
+            --enable-rubyinterp=yes \
+            --enable-python3interp=yes \
+            --with-python3-config-dir=$(python3-config --configdir) \
+            --enable-perlinterp=yes \
+            --enable-luainterp=yes \
+            --enable-gui=gtk2 \
+            --enable-cscope \
+            --prefix=$HOME/.local
+```
+
+有时组里会多人共享一个机器作为开发机，推荐vim安装在自己的HOME目录下。
+
+## 基本配置
+
+```vim
+
+```
+
+
+
+# 安装插件（面向CPP)
+
+笔者开发以CPP为主，这里插件主要面向CPP；对于Go等其他语言也有对应的插件。
+
+## YouCompleteMe
+
+```bash
+brew install llvm # clangd-10
+install.py --clangd-completer
+```
+
+# Reference
+
+- [build vim from src](https://github.com/ycm-core/YouCompleteMe/wiki/Building-Vim-from-source)
+

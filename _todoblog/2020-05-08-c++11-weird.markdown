@@ -1,0 +1,33 @@
+---
+layout: post
+title: 奇怪的CPP（c++11）
+date: 2020-05-08 10:11
+categories:
+  - C++
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+最近看了一些代码，里面充斥着各种奇怪的C++用法；之前写C++就是把他当成带class的c来用，一些特别c++范的语法几乎没用过；出于此，本文持续整理一些c++奇怪的语法，以及应用场景。
+
+# ::
+
+empty based optimation；牢记c++的一个设计哲学就是"*don't pay for what you don't use*."
+
+场景一，继承父类：
+
+- 继承自EmptyClass的子类的size不会受到base的影响；主要出于StandardLayoutTypes的考虑。
+
+场景二，成员变量 C++20：
+
+- C++的类成员的size至少为1，Empty Class Type的成员也不例外，这样能确保相同类型的不同对象有不同的地址。
+  - 因此当一个类中，只有一个EmptyClass的成员时，可以应用EBO；lass的成员标记了no_unique_address（C++20），EBO可以将一些empty class type的成员的size优化为0，这样避免占用额外的空间。
+  - 在policy based design中，比如allocater-aware的容器；需要保存一个policy的成员，比如allocate策略，如果allocator是stateless的，即是个Empty Class，这样就不需要付出额外的存储空间。
+
+
+
+# cast
+
+https://stackoverflow.com/questions/332030/when-should-static-cast-dynamic-cast-const-cast-and-reinterpret-cast-be-used
+
