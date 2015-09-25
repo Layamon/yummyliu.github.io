@@ -1,0 +1,80 @@
+---
+layout: post
+title: 简单了解X-Engine
+date: 2020-02-19 10:50
+categories:
+  - Paper
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+在这里（[LSM-tree](http://liuyangming.tech/12-2019/leveldb.html)），对Btree和LSM-tree有了初步的学习；Btree的读写是以块为单位的，那么在不考虑额外的bufferpool的前提下，Btree中每写一条记录都可能需要写一个页，存在写放大的问题；那么对于写多读少的场景下，LSM-tree相对于Btree更加占优（当然LSM-tree也有读放大的问题）。
+
+在有了初步的了解后，最近看了阿里巴巴在SIGMOD19上发表的关于X-Engine的介绍，X-Engine就是一个LSM-tree架构的存储引擎，专门针对电商场景做了深度的优化。看完之后，对LSM-tree能够加深了解，进行了简单的总结。
+
+# 问题背景
+
+首先论文中总结了电商场景的三个大问题，然后分别介绍了在这三个问题中采用了哪些优化手段；
+
+1. **tsunami**：在数据库瞬时事务量的激增情况下，仍需要保证事务的响应时间。
+   + 将事务处理中的写提交解耦，做成异步写提交，减少线程的idle等待，充分挖掘系统性能；
+   + 将写提交分解为可流水线处理的若干模块，进行流水线处理，提高吞吐；
+2. **Flood discharge**：内存大量的变更，需要及时的刷盘，以免IO阻塞。
+   + 重新设计了$Level_0$中的存储与计算方式，将其作为一个*warm data*，加速刷盘；
+   + 在compaction中，重用extent中非重叠的范围，减少IO量。
+   + compaction中部分任务使用单独的FPGA进行计算处理，节约CPU资源。
+3. **Fast-moving current**：相比于传统OLTP事务类型，电商事务的热点数据的快速变更，要求热数据能及时替换；
+   + 将extent的filter和Metadata-Index和其数据块打包在一起，方便查询。
+   + 将extent和memtable的Metadata-Index都做成多版本，能够加快数据查询。
+   + 使用多种类型cache，加速hot-record的查询。
+   + 在compaction中，增量替换cache内容，减少cache miss。
+
+了解这些优化手段，对平时业务优化还是很有启发的。
+
+> 本文是基于论文的个人理解，可能有些地方理解的有偏差，欢迎指正学习。
+
+# X-Engine架构
+
+X-Engine整体上和基于LSM-tree的存储引擎类似，在数据层面分为内存和外存两块结构；在外存分为若干层（一般三层就够了），上层不断向下进行compact；内存分为活跃的内存表（Active Memtable）和固定的内存表（Immutable Memtable），Active Memtable满了后，转换为一个新的Immutable Memtable，最终Immutable Memtable会flush到$level_0$中，作为一个extent。另外，很重要的一点，作为一个数据库引擎，Redolog是必不可少的。
+
+![image-20200220154116548](/image/20200220-xengine.png)
+
+其实这样整体就可以了解的，但是X-Engine在此基础上加了Cache，Index，FPGA，NVMe等软硬件的优化手段；就从ReadPath、WritePath和Compaction三个方面进行了解。
+
+## ReadPath
+
+在电商场景下，数据请求有很强的空间局部性（spatial locality）和时间局部性（temporal locality），基于这种前提，设计了多种类型的cache，提高检索的速度；比如row-cache可加速点查（temporal locality），block-cache可加速范围查询（spatial locality）。
+
+在X-engine中数据存储的单元为extent，大小为2MB；对于其中的数据还建立了metadata-index和Bloomfilter；在查询的时候，首先通过bloomfilter将肯定不在表中的元素筛除，然后通过metadata-index进行定位；同时metadata-index是一个多版本的index，能够。
+
+当extent中发生compaction后，extent可能会进行重用（下面compaction一节)，此时Metadata-index会建立一个新版本的Metadata-index，减少不同的read查询之间的冲突；同时对应的cache也会过期，这里采用incremently replace的方式更新cache，即如果Compacttion中，更新了cache底层的数据块，那么就同时更新cache内的block。
+
+## Write Path
+
+数据更新发生在Active Memtable，其是一个内存无锁跳表（lock-free skiplist）；X-Engine在跳表的基础上，将每条record做成多版本的。
+
+将one-thread-per-transaction的事务处理模型，变为异步处理；将write commit操作从事务处理中解耦出来，交由专门的线程进行异步刷盘；
+
+并且将write commit操作分解为四个阶段，将其流水线处理。
+
+1. Log-buffering：将事务日志拷贝到专门的内存日志缓冲区，并计算CRC32校验值；
+2. Log-flushing：将日志缓冲区刷盘，并推进LSN；
+3. Memtable-writeing：将record附加到内存的memtable中。
+4. Trx-committing：事务提交，释放持有的资源。
+
+四个阶段分别操作不同的内存或外存对象，交由专门的线程进行处理；这样提高整体的吞吐。并且根据不同阶段的特点，处理线程数量不同。
+
+## Compaction
+
+Compaction首先是Immutable Table向$level_0$进行flush。为保证快速刷盘，对$level_0$进行了改造。首先，直接将Immutable Table追加在$level_0$之后，而不进行排序，这样能够快速刷盘；但是带来的问题是$level_0$是无序的并且$level_0$的数据还是temporal locality的，会频繁访问，解决这一问题，引入了一个*intra-$level_0$ compaction*的操作；即，在$level_0$内部进行merge整理，而不将整理的结果向下层合并，这样能够保证热数据的快速访问，也减少额外的IO。
+
+另外，在Compaction过程中，对于无重叠的extent会进行重用，这样减少了大量的IO。
+
+Compaction的过程，就是mergesort中的merge的过程；一是读取两个段，二合并，三写回去；其中涉及两次IO操作，X-Engine中使用了AsyncIO，并将第二步作为第一步的回调函数，这样大大提高了整理的IO吞吐。
+
+Compact是LSM-tree中很重的操作，在X-Engine中，将其分为不同的类型进行基于规则（extent数量和整层的数据量）的调度，让数据能够及时的得到规整；并且将部分计算任务转移到FPGA中，减少了CPU代价。
+
+# 小结
+
+X-Engine针对电商场景下，对LSM-tree进行了大量的优化，包括软硬件层面上的；比如事务的分解与异步，IO的分解与异步，cache等；还是挺有收获的，lalalalal。。。。

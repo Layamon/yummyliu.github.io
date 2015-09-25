@@ -1,0 +1,144 @@
+---
+layout: post
+title: 读Paper——PolarFS
+date: 2019-06-03 16:17
+header-img: "img/head.jpg"
+categories: 
+  - Paper
+typora-root-url: ../../layamon.github.io
+---
+
+* TOC
+{:toc}
+# 研究背景
+
+## 新硬件
+
+### RDMA
+
+和本地DMA的概念类似，*remote direct memory access* 技术可以使同一网络中的主机绕过其他主机的CPU、cache、操作系统等模块直接读写其他主机的数据。其有如下优势：
+
++ zero-copy：应用程序能够直接执行数据传输，在不涉及到网络软件栈的情况下。数据能够被直接发送到缓冲区或者能够直接从缓冲区里接收，而不需要被复制到网络层。
++ Kernel bypass：应用程序可以直接在用户态执行数据传输，不需要在内核态与用户态之间做上下文切换。
++ No CPU involvement：应用程序可以访问远程主机内存而不消耗远程主机中的任何CPU。远程主机内存能够被读取而不需要远程主机上的进程（或CPU)参与。远程主机的CPU的缓存(cache)不会被访问的内存内容所填充。
++ Message based transactions：数据被处理为离散消息而不是流，消除了应用程序将流切割为不同消息/事务的需求。
++ Scatter/gather entries support：读取多个内存缓冲区然后作为一个流发出去或者接收一个流然后写入到多个内存缓冲区里去。
+
+SPDK是Intel提供的一个操作RDMA的库。
+
+### Non-Volatile Memory
+
+新型非易失存储器在持久化、随机读写能力、存储密度、扩展能力、漏电功耗等多个方面与传统的存储介质相比具有明显优势。主要考虑是的两个方面：
+
++ 持久化：融入 NVM 的新型存储环境有望跨越 CPU 与外存之间的性能鸿沟,消除计算机系统中制约上层软件设计的 I/O 瓶颈。
+
++ 直接寻址：基于一个事实：超大容量的便宜外存一直会存在于系统中；那么PMMU(page memory manager unit)就会一直存在，复制page in/out；因此，page永远是一个读写的最小单位。因此，直接寻址可预见的未来中，还是对于virtual memory的直接寻址。
+
+### 可持久化存储器
+
++ HDD：机械硬盘
+
++ NAND介质：常说的闪存记忆卡，USB，NAND SSD
++ 3DX Point介质：Intel出的基于3DX的一系列新的存储器，可称为Optane SSD，性能好，价格贵；可以作为内存的扩展或者外存的cache来用，但是要求上层软件基于其有优化。3D Xpoint较之DRAM，虽然性能稍差，但3D Xpoint不易失，也就是不像DRAM受断电问题的困扰；与NAND相比，3D Xpoint强在性能上。因此，NVM-oriented database的架构开始讨论了，比如N-store。
+  + Optane SSD: 常见的3DX技术的载体，通常用在个人电脑中，比NAND-based SSD快。
+  + Optane Memory：传统的磁盘的缓冲区。
+  + Optane DC Persistent Memory：用在Data Center中的服务器技术。
+  + Optane Memory SSD：将Optane和普通SSD混合的产物。
+
+#### NVMe
+
+NVMe和NVM不是一个东西；NVMe是和AHCI是同一类同，其是一个存储接口协议，AHCI是早期将HDD接到PCIe上的存储接口协议；NVMe是适配SSD接到PCIe上的存储接口协议。
+
+## 分布式文件系统
+
+将传统的本地文件系统抽象为一个分布式文件系统；提供类似的文件api；db基于日志即数据的概念，将redo日志放在分布式文件系统中冗余存储；这样读写节点共享同一份数据。
+
++ 副本一致性
++ 存储什么数据
+
+# PolarDB
+
+我了解的PolarDB的结构如下：
+
++ smart proxy：该层主要用于实现自动的读写分离，负载均衡，以及高可用切换与安全性验证。为了保证session Consistency；在上层的smart proxy会维护下层RO节点的redo日志重放位置，以便于读写分离时将读请求发送到有最新数据的节点。
++ PolarDB Cluster：实现了基于InnoDB的redo日志的物理复制的一主多从的集群，其中存储模块由实现的类POSIX的文件操作API替换，从而将**数据和redolog都**写入到PolarFS中。
++ PolarFS：网络上利用RDMA，wal buffer上利用3D Xpoint介质的NVRam等新硬件优化的分布式文件存储服务。这里的WAL buffer是每个chunkserver对于文件块中更改的wal；不是database的wal buffer。
+
+![image-20190605141205518](/image/polardb/polardb.png)
+
+## PolarDB与Aurora的比较
+
+| 角度               | Aurora                                                       | PolarDB                                                      |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 分布式文件存储     | 存储的数据包括RedoLog和Page，以10GB为单位划分的6副本，基于gossip协议实现数据一致性。 | 存储的数据包括RedoLog和Page，以10GB为单位划分的3副本，基于Parallel-Raft实现的数据一致性。 |
+| 向存储层写入的内容 | 只有redolog，存储层不断重建page；                            | 写入redolog和page。但是通过RDMA与OptaneSSD等新硬件优化。     |
+| 读写一致性         | 基于Quorum协议，读写按照多数派满足的方式获取最新数据。       | 数据读写只在主副本上进行。                                   |
+| 代码               | 增加物理复制的                                               | 增加InnoDB的物理复制；通过修改调用文件的api将数据写入到分布式文件存储中。 |
+| 异常恢复           | 主挂，因为底层不断的进行recovery，从秒升主。不走经典的redo/undo逻辑。 | 类似单机MySQL的恢复方式                                      |
+| 社区融合           | 与社区版本代码相差较大，比较慢跟进新功能。                   | 相对容易跟进新功能。                                         |
+
+
+
+## PolarFS结构概述
+
+PolarFS是一个用户空间的分布式文件系统。MySQL代码可以容易的从Linux FS迁移到PolarFS；提供了O_DIRECT的读写操作；支持数据页的原子写；
+
+![image-20190604181103288](/image/polardb/image-20190604181103288.png)
+
+
+
+## PolarFS的写流程
+
+1. PolarDB基于libpfs，通过ringbuffer向PolarSwitch发送IO请求
+2. PolarSwitch根据本地的metadata cache，将IO请求通过RDMA转发到Chunkserver Leader
+3. RDMS NIC模块将请求放到本地的buffer中，由chunkserver不断的拉取处理
+4. 写请求通过SPDK，写入到log块中，然后通过RDMA传播到其他follower中(这里都是异步操作，并且数据传输可以并行)
+5. follower接收到IO数据，将其写入到本地的buffer中
+6. follower利用SPDK将buffer中的数据异步写入到磁盘中
+7. leader从**大部分**的follower都收到成功的ack后，然后通过SPDK，将数据写入到data块中。
+8. leader通过RDMA，向PolarSwitch返回success
+9. PolarSwitch标记该请求done，向client返回成功。
+
+## PolarDB的优化点
+
++ 硬件：
+
+  (低延迟)Intel Optane DC Solid State Drives(SSDs) /(大容量) Intel 3D NAND SSDs
+
++ bypass Net/IO stack
+
+  避免陷入内核态的代价
+
++ ParallelRaft
+
+  高fs的吞吐
+
++ POSIX-like的文件系统API
+
+  向上兼容
+
++ 避免锁和上下文切换：
++ 读写分离中的会话一致性：一般读写分离，如果不是同步复制，只是保证最终一致性；在PolarDB中，提供了会话一致性。
+
+## PolarDB的关键点
+
+- 日志的存储：主节点将redo日志，调用分布式文件存储api，写入分布式文件系统中。
+
+- 数据的构建：RO节点从分布式文件系统中，读取相应的数据；对于Aurora，如果存储层的数据没有生成好，那么先等待。对于PolarDB，因为是由计算模块进行数据恢复，那么根据不同的复制模式（同步，异步）可能获取的数据不一致。
+
+- 从库如何回放：PolarDB是按照物理复制的方式回放数据。
+
+- 主从内存状态如何保持一致：物理复制
+
+- 内存中的锁管理：与MySQL一致
+- 元数据如何同步：物理复制
+
+# 附：NVM存储探索
+
+SSD本来具有可随机访问，持久存储的特性；但是读写性能上和内存还是有差距；在Intel提出了基于3DX Point介质的新SSD之后，针对非易失性存储器的数据库架构的研究有很多。
+
++ NVM-only 存储架构：暂不考虑
+
++ NVM+DRAM 混合存储架构
+  + NVM 的组提交(NVRAM group commit)恢复机制.该机制消除了传统管理日志所需要的缓存区,利用批量事务处理模式，减少了确保正确次序所需的写障栅次数。
+

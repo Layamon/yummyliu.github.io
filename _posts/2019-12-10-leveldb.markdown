@@ -1,0 +1,204 @@
+---
+layout: post
+title: From Btree To LSM-tree
+date: 2019-12-10 11:21
+categories:
+  - datastruct
+  - Database
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+我们常说的Btree的设计是基于HDD的；如今，存储介质的差异越来越大，因此对新的AccessMethod的研究也在不断进行。在本文中，我尝试总结下一个和Btree不同的存储结构——LSM-tree，包括四个部分：
+
+1. 介绍AccessMethod设计的RUM猜想；
+2. 回顾了经典的访问方法——Btree；
+3. 分享了对新流行的（1996年问世也不算新）的LSM-tree的学习；
+4. 通过了解X-Engine对LSM-tree的优化，加深理解。
+
+# RUM conjecture
+
+> **RUM conjecture**
+>
+> *When designing access methods we set an upper bound for two of the RUM overheads, this implies a hard lower bound for the third overhead which cannot be further reduced*
+
+![img](/image/lsm-tree/1212-rum.png)
+
+类似于分布式系统中的CAP理论，RUM猜想是设计AccessMethod的一个三角形，意思是我们很难设计一个完美的存储结构，能够同时满足Read Optimized/Update Optimized/MemoryOptimized。只能尽力满足其中两项，而牺牲第三者。因此，我们设计一个数据库存储结构时，我们需要考虑三个**放大点（amplification）**。
+
+
+
+![image-20200221103609246](/image/lsm-tree/1212-storage.png)
+
+写放大是指写入介质的数据和写入数据库的数据的比值，比值越大表示写放大越大，意味着我们完成一次写入，额外需要的IO量；为优化写放大，我们需要合并写（write consolidation)并减少数据重组（data reorganization），但这会增高读延迟并有空间上的代价。读放大是指一次查询需要读取的数据页数量，我们可以使用特定的物理索引来加速读取速度，但是这需要写更多的数据，同时也需要更多的空间。那么基于这个的猜想，来重新认识一下Btree和LSM-tree。
+
+# Btree
+
+首先来回顾以下Btree；BTREE是一个自平衡的树，相比于BST/AVL/RB-tree这些树，它是一个磁盘上的平衡树，平衡的是磁盘IO路径。如下图，简单描述了各个树的关系。
+
+![image-20191215101830900](/image/lsm-tree/1212-BBB.png)
+
+一般来说，当我们讨论Btree时，我们说的是B+-tree。假设Btree对于的表的大小是N，这意味着leafnode有N条记录；我们假设Btree的高度不包含最后一层并且每个page上有B条记录，这样我们可以得出Btree的深度为$log_{B}N/B$:
+
+> <=> $N = B^{depth+1}$
+>
+> <=> $N/B = B^{depth}$
+>
+> <=>$depth = log_{B}N/B$
+
+相比于BST，Btree更宽，更浅，从而减少读写时的磁盘IO，适合磁盘的的数据组织。另外，当读取Btree中的一条记录时，我们会将读取ReadPath中的所有节点，因此读放大等于Btree的深度；当我们写一条记录时，就需要将整页写出，因此写放大为B（这里不考虑bufferpool的写合并优化）。
+
+Btree几乎在所有传统数据库的存储引擎上都支持，比如InnoDB、PostgreSQL。而现在涌现了一些以LSM-tree为主的新兴存储引擎，理论上相比于Btree有更好的WriteOptimized，让我来瞧一瞧。
+
+# LSM-tree
+
+LSM-tree(Log Struct Merge tree) 其中的Log思想来源于Log Structured FileSystem，而不是数据库的Write Ahead Log，而LSM-tree中的Tree理论上可以被任何有序的结构替代；因此，LSM-tree的内核是Merge的思想，它充分利用了多层的存储结构，将write进行多层的缓冲，因此有了比较好的写性能。
+
+> 一句话总结LSM-tree：“Log is borrowed, Tree can be replaced, Merge is the king.”
+>
+> ![image-20200305134448348](/image/lsm-tree/1212-level.png)
+>
+> 在原论文中，有个有趣的结论——The Five Minute Rule，即，若某页的访问频率>5min/次，那么可考虑将该页放到内存中。这要求我们在设计存储引擎时，要充分利用内存和外存的存储特点。
+
+在经典论文中，LSM-tree结构的存储引擎的每一层可看做是一个有序的树结构——一个类似Btree的特殊结构，其中leafnode是压实的（没有free space）；并且是按照multi-page block进行组织，加上page是4kb，multi-page block是256kb，那么一个block里可以放64个连续的page，范围查询时可以直接读multi-page block。不同层的树会由专门的后台进程执行**rolling merge**，先从C1取一个multi-page block放到C1-buffer中，其中包含若干个C1的leafnode；然后从C0的leafnode中取entry进行合并，将合并结果追加到C1后面，如下图；新合并的节点不会覆盖原节点，旧节点可用来恢复数据。
+
+![Alt](/image/lsm-tree/1212-rollmerge.png)
+
+相比于Btree，LSM可用更少的IO完成数据的持久化，有两个原因：
+
+1. LSM-tree每次IO都是顺序写多个page（multi-page write），相比于Btree的single-page write，能够节省大量的磁盘寻道时间；尽管现在很多数据库已经不再传统磁盘上了，在SSD上，LSM-tree还是可以空间压缩和少IO长寿命的优势。
+2. 相比于Btree修改一个元组，就要写一次页；LSM-tree可以延迟批量写，充分利用IO。
+
+由于LSM-tree更多的是一个概念设计，在实际的实现中，LSM-tree有不同的实现方式，比如LevelDB，RockDB，Hbase，Cassandra等。本文中，通过LevelDB的实现来了解一下LSM-tree结构的存储引擎。
+
+> 目前有很多新的研究，融合和两者的特点，比如[append-only btree(couchDB)](https://stackoverflow.com/questions/20816698/why-does-couchdb-use-an-append-only-b-tree-and-not-a-hamt)
+
+## LevelDB
+
+当我们向LevelDB中写一个`(k,v)`时，先在redolog中写一个logrecord；然后，将其插入到MemTable，那么写入就完成了；由于数据不要求落盘，可以看出LevelDB在写入上比Btree更加高效；而Memtable中的`(k,v)`由Compaction过程将其合并到磁盘的SSTable（Sort Sequence Table(**S**tatic **S**orted **T**able)）中；
+
+Compaction主要完成两件事：归并排序和垃圾收集。一般策略有两种：
+
++ **Level-based Compaction** ：该策略下，每层只有一个有序的区段（**one sorted run**，可以切分，但是key值不重叠），相邻的下层比上层大若干倍（也成为扇出数，fan-out)，Compaction将本层区段和下层区段合并，并**重写下层**的有序区段；在原始的paper中的level-based compact是all-to-all，而在LevelDB/RocksDB中是some-to-some（具体见下文）；如果扇出数为N，那么一个compact需要多些N倍的数据（[该论文说明了大部分情况下还是小于N的](https://hyeontaek.com/papers/msls-fast2016.pdf)），因此能够减少空间放大，但是会带来读放大和写放大，适合的场景：
+  + Key-order insert
+  + Skewed write
++ **Sized-tiered Compaction** ：该策略下，每层有若干个可以重叠的区段组成（**N sorted runs**，N类似于上面的扇出数），Compaction将本层的所有区段进行归并，输出为下一层的一个区段；这样每层compacttion的写放大就是1，减小了写放大，但是会有读放大和空间放大。RocksDB下称为（Universal Compaction）
+
+> 另外针对时序数据的时序数据库，对Compact算法也有对应的优化
+
+这两种策略都是可行的，但前者为了减小写放大，牺牲了读取速度和空间利用率；后者为了读取速度和空间利用率，带来了一定的写放大。而LevelDB的Compaction是两种策略的结合，对上层使用tiered，对下层使用leveled，并且对下层进行分区，如下图：
+
+![image-20191216103816910](/image/lsm-tree/1212-leveldb.png)
+
+在LevelDB中，$Level_0$采取的是**Sized-tiered Compaction**；其他level中将key进行分区，采取**Level-based Compaction**，需要注意的是LevelDB中合并的新block不会覆盖旧的block，因为旧的block会用在recovery中。（RocksDB也是类似的，并且内存的MemTable也有多份，取决于参数[max_write_buffer_number](https://github.com/facebook/rocksdb/blob/master/include/rocksdb/advanced_options.h#L165) ）
+
+![image-20191216114802822](/image/lsm-tree/1212-leveldb-compact.png)
+
+## 小结
+
+Compaction操作是LSM-tree很重要的操作，其执行的速率（rate）控制同样重要；太快了，存在写放大的问题；太慢了，会导致读放大以及空间放大。另外由于LSM-tree的读取，需要从各个层获取数据，读放大是一个重要的问题。
+
+> 更精确的读写放大的复杂度如下，Reference From [deep dive tikv](https://tikv.github.io/deep-dive-tikv/key-value-engine/B-Tree-vs-Log-Structured-Merge-Tree.html)：
+>
+> | Data Structure       | Write Amplification | Read Amplification |
+> | -------------------- | ------------------- | ------------------ |
+> | B+ tree              | Θ($B$)              | $O(log_{B}N/B)$    |
+> | Level-Based LSM-tree | Θ($klog_{k}{N/B}$)  | Θ((log^2N/B)/logk) |
+>
+
+针对LSM-tree的优化点，主要集中在两个方面：
+
++ 减少读取时的IO量。
+  + bloom filter 但只对点查有效；还有一些*Prefix bloom filter*、*Succinct Range Filter*、*Cuckoo Filter*；
+  + Cache
+  + Index
++ 对Compaction操作进行优化：
+  + 分解compaction步骤，进行pipeline。
+  + FPGA异构计算.
+  + 《Wisckey: separate key and value, key use for sorting, value use for garbage collection.》
+
+那么，有幸阿里巴巴在SIGMOD19上发表了关于X-Engine的介绍，X-Engine就是一个LSM-tree架构的存储引擎，专门针对电商场景做了深度的优化。看完之后，对LSM-tree能够加深了解，这里进行了简单的总结。
+
+> 另外，有兴趣可以了解一下MongoDB的WiredTiger， 借助Copy On Write融合了Btree和LSM-tree的思想
+
+# X-Engine
+
+首先论文中总结了电商场景的三个大问题，然后分别介绍了在这三个问题中采用了哪些优化手段；
+
+1. **tsunami**：在数据库瞬时事务量的激增情况下，仍需要保证事务的响应时间。
+   + 将事务处理中的写提交解耦，做成异步写提交，减少线程的idle等待，充分挖掘系统性能；
+   + 将写提交分解为可流水线处理的若干模块，进行流水线处理，提高吞吐；
+2. **Flood discharge**：内存大量的变更，需要及时的刷盘，以免IO阻塞。
+   + 重新设计了$Level_0$中的存储与计算方式，将其作为一个*warm data*，加速刷盘；
+   + 在compaction中，重用extent中非重叠的范围，减少IO量。
+   + compaction中部分任务使用单独的FPGA进行计算处理，节约CPU资源。
+3. **Fast-moving current**：相比于传统OLTP事务类型，电商事务的热点数据的快速变更，要求热数据能及时替换；
+   + 将extent的filter和Metadata-Index和其数据块打包在一起，方便查询。
+   + 将extent和memtable的Metadata-Index都做成多版本，能够加快数据查询。
+   + 使用多种类型cache，加速hot-record的查询。
+   + 在compaction中，增量替换cache内容，减少cache miss。
+
+了解这些优化手段，对平时业务优化还是很有启发的。
+
+> 本文是基于论文的个人理解，可能有些地方理解的有偏差，欢迎指正学习。
+
+X-Engine整体上和基于LSM-tree的存储引擎类似，在数据层面分为内存和外存两块结构；在外存分为若干层（一般三层就够了），上层不断向下进行compact；内存分为活跃的内存表（Active Memtable）和固定的内存表（Immutable Memtable），Active Memtable满了后，转换为一个新的Immutable Memtable，最终Immutable Memtable会flush到$level_0$中，作为一个extent。另外，很重要的一点，作为一个数据库引擎，Redolog是必不可少的。
+
+![image-20200220154116548](/image/lsm-tree/20200220-xengine.png)
+
+其实这样整体就可以了解的，但是X-Engine在此基础上加了Cache，Index，FPGA，NVMe等软硬件的优化手段；就从ReadPath、WritePath和Compaction三个方面进行了解。
+
+## ReadPath
+
+在电商场景下，数据请求有很强的空间局部性（spatial locality）和时间局部性（temporal locality），基于这种前提，设计了多种类型的cache，提高检索的速度；比如row-cache可加速点查（temporal locality），block-cache可加速范围查询（spatial locality）。
+
+在X-engine中数据存储的单元为extent，大小为2MB；对于其中的数据还建立了metadata-index和Bloomfilter；在查询的时候，首先通过bloomfilter将肯定不在表中的元素筛除，然后通过metadata-index进行定位；
+
+当extent中发生compaction后，extent可能会进行重用（下面compaction一节)，此时Metadata-index会建立一个新版本的Metadata-index，减少不同的read查询之间的冲突；同时对应的cache也会过期，这里采用incremently replace的方式更新cache，即如果Compacttion中，更新了cache底层的数据块，那么就同时更新cache内的block。
+
+## Write Path
+
+数据更新发生在Active Memtable，其是一个内存无锁跳表（lock-free skiplist）；X-Engine在跳表的基础上，将每条record做成多版本的。
+
+将one-thread-per-transaction的事务处理模型，变为异步处理；将write commit操作从事务处理中解耦出来，交由专门的线程进行异步刷盘；
+
+并且将write commit操作分解为四个阶段，将其流水线处理。
+
+1. Log-buffering：将事务日志拷贝到专门的内存日志缓冲区，并计算CRC32校验值；
+2. Log-flushing：将日志缓冲区刷盘，并推进LSN；
+3. Memtable-writeing：将record附加到内存的memtable中。
+4. Trx-committing：事务提交，释放持有的资源。
+
+四个阶段分别操作不同的内存或外存对象，交由专门的线程进行处理；这样提高整体的吞吐。并且根据不同阶段的特点，处理线程数量不同。
+
+## Compaction
+
+Compaction首先是Immutable Table向$level_0$进行flush。为保证快速刷盘，对$level_0$进行了改造。首先，直接将Immutable Table追加在$level_0$之后，而不进行排序，这样能够快速刷盘；但是带来的问题是$level_0$是无序的并且$level_0$的数据还是temporal locality的，会频繁访问，解决这一问题，引入了一个*intra-$level_0$ compaction*的操作；即，在$level_0$内部进行merge整理，而不将整理的结果向下层合并，这样能够保证热数据的快速访问，也减少额外的IO。
+
+另外，在Compaction过程中，对于无重叠的extent会进行重用，这样减少了大量的IO。
+
+Compaction的过程中的merge的过程，一是读取两个段，二合并，三写回去；其中涉及两次IO操作，X-Engine中使用了AsyncIO，并将第二步作为第一步的回调函数，这样大大提高了整理的IO吞吐。
+
+ Compact是LSM-tree中很重的操作，在X-Engine中，将其分为不同的类型进行基于规则（层内的extent数量和整层的数据量）的调度，让数据能够及时的得到规整；并且将部分计算任务转移到FPGA中，节约了CPU资源。
+
+## 参考
+
+[log-structured-merge-tree](https://www.slideshare.net/ssuser7e134a/log-structured-merge-tree)
+
+[lsm-tree](http://smalldatum.blogspot.com/2018/06/the-original-lsm-paper.html)
+
+[deep-dive-tikv](https://tikv.github.io/deep-dive-tikv/key-value-engine/B-Tree-vs-Log-Structured-Merge-Tree.html)
+
+[btree and lsm](https://av.tib.eu/media/42855)
+
+[btree and lsm](http://smalldatum.blogspot.com/2015/11/read-write-space-amplification-b-tree.html)
+
+[disk io of lsm](https://medium.com/databasss/on-disk-io-part-3-lsm-trees-8b2da218496f)
+
+[scylladb compaction](https://www.scylladb.com/2017/12/28/compaction-strategy-scylla/)
+
+[compaction method](https://smalldatum.blogspot.com/2018/08/name-that-compaction-algorithm.html)
+
+[https://github.com/facebook/rocksdb/wiki/Leveled-Compaction](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction)
+
+[http://mysql.taobao.org/monthly/2018/09/04/](http://mysql.taobao.org/monthly/2018/09/04/)

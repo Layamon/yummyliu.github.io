@@ -1,0 +1,170 @@
+---
+layout: post
+title: tpcds在CstoreFDW上执行失败
+date: 2016-07-10 09:45
+header-img: "img/head.jpg"
+categories: 
+    - CitusDB
+---
+
+[TOC]
+
+
+
+### 问题描述
+
+tpcds Q5 在Cstorefdw 表上执行的时候，会报出 `ERROR:  cache lookup failed for type 0`。tpcds Q5在pg的原生表上没有出现这个问题
+
+### Debug
+
+首先可以确定的是，就是在CStore上出的问题，查看出现这个问题时候的调用堆栈，要确定最后的错误输出信息在哪。`grep -rn --include="*.c" "cache lookup failed for type"` 。找到 elog ，然而此为一个宏，在其中的elog_finish打断点。
+
+找到问题堆栈，typeid确实就是0。
+
+```
+    #0  elog_finish (elevel=20, fmt=0xb35438 "cache lookup failed for type %u") at elog.c:1341
+    #1  0x0000000000928abd in getBaseTypeAndTypmod (typid=0, typmod=0x7ffd2180507c) at lsyscache.c:2203
+    #2  0x0000000000928a54 in getBaseType (typid=0) at lsyscache.c:2178
+    #3  0x0000000000615f6b in GetDefaultOpClass (type_id=0, am_id=403) at indexcmds.c:1339
+    #4  0x00007fbf3f251f6c in GetFunctionInfoOrNull (typeId=0, accessMethodId=403, procedureId=1) at cstore_reader.c:795
+    #5  0x00007fbf3f251e27 in SelectedBlockMask (stripeSkipList=0x4b7df30, projectedColumnList=0x2e22298, whereClauseList=0x0) at cstore_reader.c:739
+    #6  0x00007fbf3f2515b2 in LoadFilteredStripeBuffers (tableFile=0x2d83100, stripeMetadata=0x3e3d990, tupleDescriptor=0x7fbe3716b4c8, projectedColumnList=0x2e22298, whereClauseList=0x0) at cstore_reader.c:485
+    #7  0x00007fbf3f250ecc in CStoreReadNextRow (readState=0x3eaf660, columnValues=0x3e3b958, columnNulls=0x3e3ba70 '\001' <repeats 23 times>, "~\177\177\177\177\177\177\177\177@`u\002") at cstore_reader.c:260
+    #8  0x00007fbf3f24d89f in CStoreIterateForeignScan (scanState=0x3e3b120) at cstore_fdw.c:1590
+    #9  0x00000000006a0c20 in ForeignNext (node=0x3e3b120) at nodeForeignscan.c:51
+    #10 0x000000000067b114 in ExecScanFetch (node=0x3e3b120, accessMtd=0x6a0bd0 <ForeignNext>, recheckMtd=0x6a0c7a <ForeignRecheck>) at execScan.c:95
+```
+
+由于Q5 的SQL很长，不确定是哪里出问题了；一点点精简 sql 发现，问题出在如下查询上：
+
+``` sql
+    /* 有问题 */
+    select
+        cast(0 as numeric(7,2)) as aaa
+        from store_sales
+        union all
+    select
+        sr_return_amt as aaa
+        from store_returns
+    limit 2;
+    /* 上下颠倒下就没问题了 */
+    select
+        sr_return_amt as aaa
+        from store_returns
+        union all
+    select
+        cast(0 as numeric(7,2)) as aaa
+        from store_sales
+    limit 2;
+
+    /* 换一种类型，上下颠倒一下也没问题了 */
+    select
+        ss_ticket_number as ticket_number
+        from store_sales
+        union all
+    select
+        cast(0 as integer) as ticket_number
+        from store_returns
+        limit 2;
+
+    select
+        ss_ticket_number as ticket_number
+        from store_sales
+        union all
+    select
+        cast(0 as integer) as ticket_number
+        from store_returns
+        limit 2;
+```
+
+基本确定了问题的产生的具体情境，开始追代码；从堆栈的信息来看，出现问题的时候：Cstore需要从pg_opclass的cache中查找type相应的访问函数；
+
+typeid = 0 cache没找到：
+
++ 可能1：0是非法值；
++ 可能2：0代表的type没有cache到内存中；按理说cache没命中，不会报错，只会延迟一下，之后到具体的地方找。
+
+所以**0是非法值**的可能比较大。
+查询 [pg_type][pt] (oid的 是pg_type的隐藏属性)，发现并没有oid等于0的类型，所以typeid=0明显不对
+
+``` sql
+    tpcdso100g=# select oid,* from pg_type where oid = 0;
+    (0 rows)
+
+    tpcdso100g=# select oid,* from pg_type where oid = 1700;
+    -[ RECORD 1 ]--+-----------------
+    oid            | 1700
+    typname        | numeric
+```
+
+从代码里分析，找到typeid被赋值的地方；
+
+Cstore按列读取数据，其中可以对每一列进行过滤，过滤的时候用到了类型相关的函数；而在之前，需要提取某一个表具体需要的那些列——ColumnList。
+
+``` cpp
+    /* first add the columns used in joins and projections */
+    neededColumnList = list_copy(targetColumnList);
+
+    /* then walk over all restriction clauses, and pull up any used columns */
+    foreach(restrictInfoCell, restrictInfoList)
+    {
+        RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+        Node *restrictClause = (Node *) restrictInfo->clause;
+        List *clauseColumnList = NIL;
+
+        /* recursively pull up any columns used in the restriction clause */
+        clauseColumnList = pull_var_clause(restrictClause,
+        PVC_RECURSE_AGGREGATES,
+        PVC_RECURSE_PLACEHOLDERS);
+
+        neededColumnList = list_union(neededColumnList, clauseColumnList);
+    }
+```
+
+在ColumnList此处断点，发现：typeid=0 对应的是 T_Const, 就是 `cast(0 as numeric) as aaa`,
+而同时发现：同样的表从baserel中获得的targetColumnList并不相同,。**store_sales**中并没有某一列，只是为了`Union all` 做了一个常数的假列。
+
+> 至于pg 为什么会有如下的情况，需要另记了
+> 执行
+>
+> ```sql
+> select
+>     cast(0 as numeric(7,2)) as aaa
+>     from store_sales
+>     limit 2;
+> ```
+>
+> targetColumnList为空，
+> 而执行
+>
+> ```sql
+> select
+>     cast(0 as numeric(7,2)) as aaa
+> from store_sales
+> union all
+> select
+>     sr_return_amt as aaa
+> from store_returns
+> limit 2;
+> ```
+>
+> targetColumList不为空
+
+### 原因
+
+因此，ColumnList需要得到某个表的实际参与执行的列，源代码中没有辨别这种情况。
+如下，增加判断：
+
+``` cpp
+		if (column != NULL && column->xpr.type!=T_Const)
+		{
+			columnList = lappend(columnList, column);
+		}
+```
+
+如上bug消失，tpcds Q5成功执行 it works!
+
+
+
+
+[pt]: http://www.runoob.com/manual/PostgreSQL/catalog-pg-type.html

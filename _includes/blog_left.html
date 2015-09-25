@@ -1,0 +1,14 @@
+<div class="container-fluid">
+    <ul id="main-menu" >
+        <li>
+            <a id="site-title"  href="{{ "/" | prepend: site.baseurl }}">
+                <img src="{{site.logo_location}}">
+            </a>
+        </li>
+        {% for menuItem in site.data.menu.mainmenu %}
+        <li><a href="{{ menuItem[1].url | prepend: site.baseurl }}">
+                <i class="fa {{menuItem[1].icon_class}}"></i> {{menuItem[1].text}}</a>
+        </li>
+        {% endfor %}
+    </ul>
+</div>

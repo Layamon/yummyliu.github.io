@@ -1,0 +1,111 @@
+---
+layout: post
+title: CMAKE问题整理
+date: 2016-09-04 22:59
+header-img: "img/head.jpg"
+categories: 
+    - C++
+    - Cmake
+---
+
+* TOC
+{:toc}
+
+
+> **NOTE:**
+>
+> 不论环境变量$PATH怎么设置，cmake在生成Makefile时，如果不指定编译器，生成的Makefile都会调用/usr/bin下的g++/gcc。
+
+# 指定版本号和policy
+```cmake
+cmake_minimum_required(VERSION 2.8)
+cmake_policy(SET CMP0015 OLD) // 该设置决定，编译后的执行文件，使用动态链接库的位置是使用相对位置还是绝对位置
+```
+# 工程名
+
+```cmake
+project (dbpool)
+```
+
+# flags
+
+**使用的是list+APPEND, 否则的话会被覆盖**
+```cmake
+set(CMAKE_CXX_COMPILER  "g++")
+list(APPEND CMAKE_CXX_FLAGS "-std=c++11 -g -Wall") 
+
+set(CMAKE_BUILD_TYPE "Debug")
+set(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "$ENV{CXXFLAGS} -O3 ")
+```
+
+# pre define
+编译时的一些预定义宏是否开启，
+比如`-D_REENTRANT`告诉编译器我们需要可重入功能
+编译器会：
+1. 它会对部分函数重新定义它们的可安全重入的版本，这些函数名字一般不会发生改变，只是会在函数名后面添加\_r字符串，
+如函数名gethostbyname变成gethostbyname\_r。
+2. stdio.h中原来以宏的形式实现的一些函数将变成可安全重入函数。
+3. 在error.h中定义的变量error现在将成为一个函数调用，它能够以一种安全的多线程方式来获取真正的errno的值。
+```cmake
+ADD_DEFINITIONS(
+    #-D_FILE_OFFSET_BITS=64
+    #-DAC_HAS_INFO
+    #-DAC_HAS_WARNING
+    #-DAC_HAS_ERROR
+    #-DAC_HAS_CRITICAL
+    #-DTIXML_USE_STL
+    #-Wno-literal-suffix
+    #-Wno-unused-variable
+    #-Wno-unused-function
+    #-Wno-sign-compare
+    #-Wno-deprecated
+    #-Wno-unused-parameter
+    #-DAC_HAS_DEBUG
+    #-DLINUX_DAEMON
+    #-DUSE_CACHE
+    #-DENCRYPT
+        )
+```
+
+# 第三方库的路径
+```cmake
+set (MYSQL_INCLUDE_DIR /usr/include/mysql)
+set (MYSQL_LIB /usr/lib64/mysql)
+```
+
+# 所有的 lib & include
+```cmake
+LINK_DIRECTORIES(./ ${MYSQL_LIB})
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_LIST_DIR} ${MYSQL_INCLUDE_DIR})
+```
+
+# 源文件
+```cmake
+set (dbpool_SRC
+    dbpool.cpp
+)
+```
+
+# 输出目录
+```cmake
+set (LIBRARY_OUTPUT_PATH ./build)
+SET(EXECUTABLE_OUTPUT_PATH  ./)
+```
+
+# 编译类型
+
+## 库 (STATIC, SHARED, or MODULE)
+```cmake
+add_library (dbpool SHARED ${dbpool_SRC})
+```
+
+## 可执行文件
+```cmake
+#ADD_XXXX必须在TARGET_LINK_LIBRARIES前面，否则会报错                       
+#ADD_LIBRARY(${PROJECTNAME} SHARED/STATIC ${SRC_LIST})                     
+ADD_EXECUTABLE(sunlands_msg_server ${SRC_LIST})                            
+
+TARGET_LINK_LIBRARIES(sunlands_msg_server base protobuf slog crypto pthread ) 
+```
+

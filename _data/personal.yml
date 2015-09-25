@@ -1,0 +1,11 @@
+---
+  name: "刘阳明/Layamon"
+  position: "欢迎关注!如果对您有帮助,十分荣幸😝"
+  #company: "Bytedance"
+  location: "Beijing, China"
+  email: "sdwhlym@gmail.com"
+  book: "《PostgreSQL指南：内幕探索》"
+  gravatar: "/image/weixinhao.jpg"
+# Featured Tags
+featured-tags: true                     # whether or not using Feature-Tags
+featured-condition-size: 0              # A tag will be featured if the size of it is more than this condition value

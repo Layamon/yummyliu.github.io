@@ -1,0 +1,23 @@
+---
+layout: post
+title: concurrent btree bench
+date: 2021-03-12 09:23
+categories:
+  - Database
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+- PostgreSQL，B+ link tree（**Lehman & Yao**），增加了 right link / high key信息，下称Blink。Blink假设所有的key都是unique，并且key是fixedsize；假设blink的page在内存的copy非共享的，这样预期读操作不加锁，写操作只需要加有限量的锁（最多3个）；
+  - 而在PostgreSQL中，基于实际需要有一些改变。
+    1. 增加了Left-link，为了支持forward scan；
+    2. **key并不是唯一的**，也不是fixedsize；**Q1：如何解决key不唯一？**
+    3. 由于Buffer是全局的，内存的page副本是共享的，读操作还是需要加page-level的读锁。
+- MySQL（InnoDB），B+ tree with lock protocol：write intent lock
+
+
+
+在PostgreSQL的磁盘文件中，每个Blink对应一个[BTMetaPageData](https://github.com/Layamon/postgres/blob/56a997413391337f7fb9926144d6b6fa831b9d22/src/include/access/nbtree.h#L96)，其主要存储了blink的root的block块，特别的是，还存储了fast root的位置；
+
+> fast root：最低的single page level
+

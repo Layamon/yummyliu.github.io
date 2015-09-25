@@ -1,0 +1,388 @@
+---
+layout: post
+title: C++11——Concurrency
+date: 2020-02-11 16:50
+categories:
+  - Linux
+  - C++
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+一直就是野路子c++，主要就是以c++98的方式写代码；前段时间看了MySQL8中的redolog无锁优化，对其中c++11的并发框架的运用印象深刻，决定要了解一下C++11的新东西了，跟上潮流😂。这里就从并发这块开始看吧，先补补基础知识！
+
+# 关于锁
+
+并发编程中最常见的概念就是同步，而实现同步的方式有很多种，有互斥锁（mutex），原子变量（atomic），自旋锁（spinlock），信号量（singal），读写锁（share/exclusive lock）等等。本文主要讨论前三种：
+
++ 互斥锁：mutex需要陷入内核态，存在上下文切换的代价，主要代价在cpu-sys。
++ 自旋锁：spinlock通常基于CAS等原子操作实现，如果当下没有取到锁，那么会在用户态自旋等待一段时间，避免频繁陷入内核态，代价在cpu-usr。
++ 原子变量：封装了原子操作的变量，不需要锁，也能保证并发更新的正确性；前两个可用在某段临界区的互斥上，原子变量的互斥临界区可认为缩小到一个变量的更新。
+
+下面对这三类进行简单展开。
+
+## spinlock
+
+自旋锁的概念是在PostgreSQL中了解到的，自旋锁（SpinLock）作为PostgreSQL最底层的锁（关于PostgreSQL的锁，可见另一篇——[Lock in PG](http://liuyangming.tech/05-2018/lock-PostgreSQL.html)），它的实现是和操作系统和硬件环境相关的。在PostgreSQL中，实现了两种SpinLock：
+
+- Hardware-dependent，利用TAS指令集实现(s_lock);
+
+  ```c
+  static __inline__ int
+  tas(volatile slock_t *lock)
+  {
+  	register slock_t _res = 1;
+  
+  	__asm__ __volatile__(
+  		"	lock			\n"
+  		"	xchgb	%0,%1	\n"
+  :		"+q"(_res), "+m"(*lock)
+  :		/* no inputs */
+  :		"memory", "cc");
+  	return (int) _res;
+  }
+  ```
+
+  在编程语言中，CPU有时不会从内存读取，会直接从寄存器中读取变量值；那么，定义变量为volatile，表示这个变量是易失的，所以会编译器会强制每次都去内存中取原始值，而不是直接拿寄存器中的值，常用在锁变量等对象上。
+
+- Hardware-independent，利用PostgreSQL定义的信号量PGSemaphore实现(spin)。
+
+  ```c
+  int
+  tas_sema(volatile slock_t *lock)
+  {
+  	int			lockndx = *lock;
+  
+  	if (lockndx <= 0 || lockndx > NUM_SPINLOCK_SEMAPHORES)
+  		elog(ERROR, "invalid spinlock number: %d", lockndx);
+  	/* Note that TAS macros return 0 if *success* */
+  	return !PGSemaphoreTryLock(SpinlockSemaArray[lockndx - 1]);
+  }
+  /*
+   * PGSemaphoreTryLock
+   *
+   * Lock a semaphore only if able to do so without blocking
+   */
+  bool
+  PGSemaphoreTryLock(PGSemaphore sema)
+  {
+  	int			errStatus;
+  
+  	/*
+  	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
+  	 * from the operation prematurely because we were sent a signal.  So we
+  	 * try and lock the semaphore again.
+  	 */
+  	do
+  	{
+  		errStatus = sem_trywait(PG_SEM_REF(sema));
+  	} while (errStatus < 0 && errno == EINTR);
+  
+  	if (errStatus < 0)
+  	{
+  		if (errno == EAGAIN || errno == EDEADLK)
+  			return false;		/* failed to lock it */
+  		/* Otherwise we got trouble */
+  		elog(FATAL, "sem_trywait failed: %m");
+  	}
+  
+  	return true;
+  }
+  ```
+
+一般来说，自旋锁需要占用CPU资源进行不断的检查，对于**比较耗时的操作【较大的临界区】，通常不建议使用**，会浪费太多的CPU资源。
+
+自旋锁通常是第一种实现，会使用一个volatile变量：lockvar，表示该变量极易改变，这样编译器就不会对该变量进行任何优化，比如乱序， 避免影响原有逻辑。在执行中，lockvar是由load加载到cpu  core的寄存器中，然后通过store指令写到磁盘中，尽管编译器不会乱序优化，但是流水线执行的时候还是可能会乱序重排。
+
+因为cpu的流水线会乱序执行，但是为了保证memory order正确性，需要保证store之后的load，不会提前执行；
+
+> memory order：指的是load和store指令的相对顺序。Memory Order Violation: A load is executed before a prior store, reads the wrong value
+
+因此，在实际执行中，如果某个core load了某个地址的内容后，并且按照乱序重排了指令；那么，在这之后，另一个core对同一地址执行了store；那么执行load指令的原core的流水线顺序可能发生memory order violate，需要重排（这是很费时的）。
+
+在spin lock场景中，这经常发生；等锁的core不断执行load，执行了几次都失败后，系统按照常理推测出后续应该都失败，就按照失败的逻辑排列了load指令；但是可能刚排列好，另一个core就解锁了，即，执行了store命令；那么spink lock 对应的load流水线，就得重排；为了避免这个代价，intel的cpu引入了pause指令，这样load先不着急预测排列。
+
+## atomic
+
+PostgreSQL在9.6版本中，将bufferpool中的spinlock替换为atomic operations（[commitlog](https://commitfest.postgresql.org/9/408/#)），例如下面的commitlog：
+
+```c
+-		LockBufHdr(buf);
+-		buf->refcount++;
++		pg_atomic_add_fetch_u32(&buf->refcount, 1);
++
+```
+
+其将`refcount`设计成一个原子变量，借助底层的add_fetch原子指令进行操作；相比于lock，类似cas的原子操作有是乐观的。很多用lock实现的地方，可以变成原子操作，这样能够减少锁的额外代价，实现lock-free；但是不等于wait-free。在gcc中，提供了类似的操作，比如`__sync_lock_test_and_set`。而在在C++11中有原子变量类型，提供了各种原子操作；原子操作是操作系统提供最小的且不可并行化的指令。
+
+PostgreSQL类似的原子操作有：
+
++ Test and set：`pg_atomic_test_set_flag_impl`;
++ Compare and exchange：`pg_atomic_compare_exchange_u32_impl`;
++ Fetch and add：`pg_atomic_fetch_add_u32_impl`。
+
+在InnoDB5.7的os0sync中同样封装了原子操作，而在8中，直接使用了C++11的原子类型。·
+
+## Mutex
+
+关于Mutex，主要了解一下futex调用，**futex**是**Fast Userspace muTEX**的简称。是在2003由IBM的工程师引入到Kernel中的，主要用于减小高并发下锁同步是system call的代价。
+
+由于在大部分情况下，锁上并没有竞争。应用可基于硬件提供的原子操作就可以进行锁资源的占用了。
+
+> Most modern processors have built-in atomic instructions implemented in HW. For example on Intel architectures `cmpxhg` is an instruction. While it's not as cheap as non-atomic instructions (especially in multi-core systems), it's significantly cheaper than system calls.
+
+对于少部分情况下，获取锁时确实存在竞争，此时通过原子操作获取锁可能会失败。如果锁获取失败，有两种处理方案：
+
++ 方案一是不断自旋检查锁资源是否可用，但是这样会浪费CPU资源；
++ 方案二就可用先将当前线程（进程）状态变为sleep，等到锁资源释放了，再唤醒处理，那么如何进行sleep/wakeup呢？这里就需要[`futex`]([futex overview](https://eli.thegreenplace.net/2018/basics-of-futexes/#id9))了。
+
+```c
+#include <linux/futex.h>
+#include <sys/time.h>
+
+int futex(int *uaddr, int futex_op, int val,
+          const struct timespec *timeout,   /* or: uint32_t val2 */
+          int *uaddr2, int val3);
+```
+
+futex调用接口如上，futex_op参数定义了多种不同的操作，比如`FUTEX_WAIT`和`FUTEX_WAKE`，一个是等待`uaddr`处的数据等于val，一个是唤醒等待的线程（进程）。
+
+![image-20200216101837409](/image/2020-0215-futex.png)
+
+这样实际上，内核帮用户态线程维护了一个锁队列，如上图，thread通过`FUTEX_WAIT`通知内核将自己挂起并排队，然后由另外一个进程通过`FUTEX_WAKE`释放该锁，并唤醒队列中的线程（唤醒时，可通过参数指定唤醒数量）；这就是上面所述的方案二的简单原理，避免了队列中每个线程都不断的检查原子变量，而消耗CPU资源；并且Futex大部分是在用户态完成的，减少了陷入内核态的代价。
+
+> 实际上Futex是通过一个hash table维护各个key，如下图，详细的实现逻辑，有兴趣可以继续了解：
+>
+> ![Futex implementation diagram from LWN](/image/2020-0215-futex-lwn-diagram.png)
+>
+> 而且futex可作用的共享资源不仅仅是多线程并行中的共享变量，还有多进程中的资源，比如mmap(2) 或 shmat(2)创建的共享内存，
+
+futex一般用在低冲突的锁同步场景中。在实际代码中，我们经常会用到`mutex`进行线程互斥，mutex底层就是基于futex和atomics实现的，即，通过atomics存储锁字节，然后通过futex进行atomics的检测，[这里](https://github.com/eliben/code-for-blog/blob/master/2018/futex-basics/mutex-using-futex.cpp)有个简单实现样例。实际的例子，我们可以参见glibc中的`pthread_mutex_t`，翻看NPTL（Native_POSIX_Thread_Library）的代码可以从注释中了解一二（sysdeps/nptl/lowlevellock.h）：
+
+```c
+/* Low-level locks use a combination of atomic operations (to acquire and
+   release lock ownership) and futex operations (to block until the state
+   of a lock changes).  A lock can be in one of three states:
+   0:  not acquired,
+   1:  acquired with no waiters; no other threads are blocked or about to block
+       for changes to the lock state,
+   >1: acquired, possibly with waiters; there may be other threads blocked or
+       about to block for changes to the lock state.
+
+   We expect that the common case is an uncontended lock, so we just need
+   to transition the lock between states 0 and 1; releasing the lock does
+   not need to wake any other blocked threads.  If the lock is contended
+   and a thread decides to block using a futex operation, then this thread
+   needs to first change the state to >1; if this state is observed during
+   lock release, the releasing thread will wake one of the potentially
+   blocked threads.
+ ..
+ */
+```
+
+基于以上的了解，基本对多线程中的资源同步有了简单的了解，而在实际编程中，可能会涉及更多的问题；
+
+2000年以后，随着处理器架构的变化，很多编程语言都内建了并行编程的支持；而在C++中，一般还是通过pthread和OpenMP进行多线程编程；在C++11中，对并行编程模型进行了系统的封装，下面就了解一下C++11中的并行编程模型。
+
+# Concurrency C++11
+
+> *Concurrency* means that two or more calculations happen **within the same time frame**, and there is usually some sort of **dependency** between them. *Parallelism* means that two or more calculations happen **simultaneously**. Parallel is subset of Concurrency; 
+
+在C++11中，`std::thread`进行了跨平台的线程封装；原来通过pthread的多线程编程，就可变为这样了：
+
+```c++
+int main()
+{
+    int n = 0;
+    std::thread my_thread(f1, n + 1); // pass by value
+    my_thread.join();
+}
+```
+
+下面，从三个方面，对C++11的并发编程框架进行简单介绍：
+
+1. 数据的原子操作，atomic/memory_order
+2. 数据的共享与互斥，thread_local/mutex/condition_variable
+3. 线程的执行与退出，CPU affinity/quick_exit
+
+## 原子变量
+
+在C++11中，在标准库内引入了多线程的支持，进而引入了atomic类型支持，只要可以trival copyable的类型都可以atomic；通过atomic类型，编译器确保该变量可以原子的访问，一般是基于CPU提供的指令，保证内存变量的互斥访问。
+
+> NOTE_0：内存互斥
+>
+> std::atomic<int> xs[N]; CPU load xs[0]的时候会对xs[0]确保互斥；但实际可能会对齐cache line，从而xs[1]也被互斥访问了。
+
+> NOTE_1：指令
+>
+> xchg ： https://www.felixcloutier.com/x86/xchg
+>
+> If a memory operand is referenced, the processor’s locking protocol is automatically implemented for the duration of the exchange operation, regardless of the presence or absence of the LOCK prefix or of the value of the IOPL. 
+>
+> 通过xchg指令，确保指令执行期间相应内存是被lock的，从而保证原子性。
+>
+> 指令LOCK前置
+>
+> LOCK不是一个指令，其只是一个前置hit，表示下一条指令是需要互斥的。
+
+> NOTE_2：trival copyable
+>
+> - 连续内存
+> - copy构造函数 可以直接用memcpy
+> - 没有virtual func
+
+> NOTE_3：is_lock_free?
+>
+> 虽然trivial copyable的类型可以使用atomic模板，但是取决于CPU的alignment、padding等因素，可能不是lock_free的，编译器底层还是[基于锁实现](https://stackoverflow.com/questions/50298358/where-is-the-lock-for-a-stdatomic)的；通过**atomic<T>.is_lock_free确认**。
+>
+> <img src="/image/futex/atomic-type.png" alt="image-20210728182009285" style="zoom: 33%;" />
+
+### 内存顺序模型
+
+原子变量只能保证自己操作的原子性；通常原子变量作为一种同步原语，需要基于此实现lock-free的数据结构；其他非atomic的变量的内存同步访问通过memory barrier保证（当然也包括atomic变量自己）。在MySQL8中，对log模块进行了大量的重构，其中就包括异步无锁刷盘的逻辑，比如这里就通过`atomic_thread_fence`进行内存顺序的保证：
+
+```c++
+ using atomic_lsn_t = std::atomic<lsn_t>;
+...
+/* Do not reorder writes above, below this line. For x86 this
+ * protects only from unlikely compile-time reordering. */
+ std::atomic_thread_fence(std::memory_order_release);
+```
+
+除了通过atomic_thread_fence来指定之外，也可在原子变量的成员函数上附加barrier信息来达到barrier的效果。
+
+barrier的引入解决乱序带来的逻辑错误；乱序来自两类：软件层面和硬件层面。硬件层面上，CPU在超标量流水线（**Superscalar**）执行中，一个时钟周期会执行多条指令。对于一些硬件上没有相关性的指令，这会造成代码执行顺序与原来不一样；软件层面上，在代码编译中，编译器也会会执行重新排列指令，进行乱序执行的优化。
+
+> 比如一个data变量与一个flag变量；准备好data之后，设置flag通知另外一个线程进行后续处理；如果flag与data的读写顺序发生错误，程序的逻辑就不对了。
+
+不同的处理器架构的内存模型不一样。如果指令严格按照顺序执行，这叫强顺序的架构（比如x86），否则叫弱顺序（比如PowerPC，ArmV7等）。那么对于弱顺序的机器，为了保障执行的顺序，在汇编指令中有内存栅栏(**memory barrier**、**memory fence**）的指令，比如PowerPC的sync，在执行到内存栅栏时，会等待之前的指令都执行完成后再执行后面的指令。memory barrier可认为有三种：
+
+1. full memory barrier：该指令前的acquire(read)/release(write)指令全部完成后，才能执行后面的指令。
+2. acquire(read, load) memory barrier：该指令前的acquire指令全部完成后，才能执行后面的指令。
+3. release(write, store) memory barrier:该指令前的release指令全部完成后，才能执行后面的指令。
+
+对于原子类型默认是full memory barrier，这可能会限制并发性能的提升。而如果我们可以对于某些场景并不需要原子类型保证顺序一致性，在C++11中，通过`memory_order`来让程序员为原子操作指定内存顺序，这里的顺序对应的操作都是原子类型的存取操作，有如下6种：
+
++ `memory_order_relaxed`：不对执行顺序做任何保证；
++ `memory_order_acquire`：本线程中，后续的**所有**读操作需要在当前指令结束后执行；
++ `memory_order_release`：本线程中，之前的**所有**写操作都完成后，才能执行当前指令；
++ `memory_order_acq_rel`：结合上两条；
++ `memory_order_consume`：本线程中，后续与**本原子变量相关**的读写操作，必须在本指令完成后执行；
++ `memory_order_seq_cst`：全部读写都按顺序执行，默认值；
+
+具体使用的时候，是通过多者的语义结合，完成多线程间的内存存取的语义，常见的就四种：`memory_order_acquire`和`memory_order_release`经常结合使用，这种内存顺序成为**release-acquire内存模型**；而`memory_order_consume`是`memory_order_acquire`的更加弱化版本，`memory_order_release`和`memory_order_consume`可以建立关于某原子变量的生产者-消费者顺序，这称为**release-consume内存模型**。加上`memory_order_relaxed`的**松散内存模型**和默认的**顺序一致型内存模型**，是c++11中典型的四种内存模型。
+
+### CAS
+
+compare_and_swap是实现lock-free structure的主要操作；这里重点关注一下这个操作。
+
+cas在std中提供了weak和strong两种操作类型，weak主要的语义就是有可能发生spurious failure：
+
+- 及时var的当前值等于expect，还是会返回false；需要继续尝试；failure的原因是因为当判断相等后，hardware修改内存值之前需要获取内存的排他访问，strong的话会一直等待直到成功；weak则是类似一个time_lock，超时就返回失败；
+- 这取决于硬件实现相关，X86就是strong。
+- cas需要提供两个memory barrier，一个是load，一个是比较之后的store。
+
+## 数据的共享与互斥
+
+线程间的数据共享需要保证并发执行的正确性，需要[同步原语](https://www.modernescpp.com/index.php/c-core-guidelines-be-aware-of-the-traps-of-condition-variables)进行同步，而对于一些共享数据当不存在并发冲突的可以基于线程的本地存储。
+
+### 线程本地存储
+
+对于栈内变量，肯定就是线程本地的；但是对于全局变量，一般就是全局共享的，而如果我们想将一些全局变量变成线程本地存储的，在一个编译器中可以加`__thread`前缀，而在c++11中，对其进行了统一，使用`thread_local`关键字：
+
+```c++
+int thread_local errCode;
+```
+
+thread_local的具体实现方式不同的编译器不一样，有的是在一开始就分配好，有的是动态分配的，但一般来说thread_local变量的性能一般不高于全局变量。
+
+### mutex
+
+通过mutex，对某段临界区进行互斥访问，可以通过lock_guard进行简化，lock_guard是按照RAII的方式进行mutex管理。
+
+```cpp
+std::mutex my_mutex;
+int main(int argc, char *argv[])
+{
+	{
+		std::cout << "block in" << std::endl;
+		std::lock_guard<std::mutex> lock(my_mutex);
+		test t;
+		std::cout << "block out" << std::endl;
+	}
+	std::cout << "out" << std::endl;
+	return 0;
+}
+```
+
+### condition_variable
+
+如果对某个数据的处理，线程间存在偏序关系，那么通过信号量进行同步；c++11中的信号量是condition_variable：
+
+```cpp
+void waitingForWork(){
+    std::cout << "Waiting " << std::endl;
+    std::unique_lock<std::mutex> lck(mutex_);
+    condVar.wait(lck);                       // (1)
+    std::cout << "Running " << std::endl;
+}
+
+void setDataReady(){
+    std::cout << "Data prepared" << std::endl;
+    condVar.notify_one();                   // (2)
+}
+```
+
+## 线程的执行与退出
+
+### CPU affinity
+
+在Linux下，通过命令taskset或系统调用（`sched_getaffinity`）可以设定process与某个CPU核的绑定关系；如果通过pthread进行多线程编程，可以通过`pthread_setaffinity_np`或`pthread_attr_setaffinity_np`进行线程与CPU的绑定。那么，在C++11中，可通过`threads[i].native_handle()`获得thread在当前平台的ID，然后通过相应的方式进行CPU绑定：
+
+```cpp
+// Create a cpu_set_t object representing a set of CPUs. Clear it and mark
+// only CPU i as set.
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(1, &cpuset);
+int rc = pthread_setaffinity_np(my_threads.native_handle(),
+                                sizeof(cpu_set_t), &cpuset);
+if (rc != 0) {
+  std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+}
+```
+
+### 快速退出
+
+进程退出时，如果是异常退出，一般走`abort`，这时不会进行析构函数的调用，有可能会产生coredump；如果是正常退出，一般走`exit`，这时会进行析构函数的调用，也会调用`atexit`注册的清理函数。有时为了快速正常退出，不想走大量的析构函数，在C++11中，提供了`quick_exit`以及对应的`at_quick_exit`接口。
+
+> 可重入（reentrant）函数、线程安全（thread-safe）函数、幂等（idempotence）函数：
+>
+> 首先这两个概念没有任何包含关系，一个函数可以满足两者也可以两者都不满足，或只满足其中一个。
+>
+> 可重入([reentrance func](https://en.wikipedia.org/wiki/Reentrancy_(computing)))概念的提出是在单进程单线程的背景下，意思是函数在执行的过程中，可以中断当前执行，再次调用该函数，而不会出错，当前的执行函数也不一定会等待。其常见的场景是发生了硬件中断或函数递归调用，
+
+# Boost:Fiber
+
+关于并发，还有个值得一提的概念——协程；在go和python等语言中都提出了协程的概念，比如goroutine；Boost:Fiber可认为是C++中的协程，但是[提供的功能更多](https://stackoverflow.com/questions/35992854/difference-between-goroutines-and-boost-fiber)。
+
+> 当然还有很多别的C++协程实现，这里就只了解下Boost中的，毕竟Boost是C++中很强大的库，甚至可以约等于基础库了😂
+
+Fiber相比于thread的好处在于可以主动让出CPU（yield），这样在同一个thread中，可以有多条执行任务**互相协作**完成整体工作，因此Fiber的调度方式是主动的，并且是用户态进行context switch，更加轻量级（需要更少的CPU指令）；
+
+> 从另外一个角度也可以认为协程的concurrency问题少一些，毕竟是自己定义协作方式，主动让出资源。
+
+[fiber的调度](The fibers in a thread are coordinated by a fiber manager. Fibers trade control cooperatively, rather than preemptively: the currently-running fiber retains control until it invokes some operation that passes control to the manager. Each time a fiber suspends (or yields), the fiber manager consults a scheduler to determine which fiber will run next.)通过fiber_manager管理，当fiber执行yield或者suspend等让出控制权的操作时，manager就会调度下一个fiber执行。具体的调度算法可以有多重，继承自algorithm类：
+
+```cpp
+struct algorithm {
+    virtual ~algorithm();
+    virtual void awakened( context *) noexcept = 0;
+    virtual context * pick_next() noexcept = 0;
+    virtual bool has_ready_fibers() const noexcept = 0;
+    virtual void suspend_until(        std::chrono::steady_clock::time_point const&) noexcept = 0;
+    virtual void notify() noexcept = 0;
+};
+```
+
+> Boost:Fiber需要C++11的支持

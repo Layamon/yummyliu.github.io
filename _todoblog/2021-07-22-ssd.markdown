@@ -1,0 +1,91 @@
+---
+layout: post
+title: SSD相关概念的总结
+date: 2021-09-02 16:42
+categories:
+  - Paper
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+从事数据库工作以来，除了虚拟机之外，DB基本都是在SSD之上工作；从最开始的做DBA时，为SSD调整random_page_cost的简单认识，到现在做存储引擎研发需要对IO栈的更多了解，基本都停留在Block Layer后，再没有细究，因此对SSD并没有比较系统的认识；最近接着一次论文分享的契机，系统认识了一下SSD；本文从SSD命名的区分到具体的内部结构简单讲述了SSD的概貌。
+
+# 接口与协议
+
+最常听说的SSD就是NVME SSD，另外就是SATA，这些有什么区别呢？这里包含了三个概念：总线协议，电气接口和具体的存储协议；NVME表示的是存储协议，支持NVMe协议的SSD通常就是链接在PCIe总线上，但是具体插在哪种电气接口上又不一定，如下是一个科普Up（硬件茶谈）整理的图，我觉得梳理的很清晰了。
+
+<img src="/image/linux-io/interface-protocol-bus.png" alt="image-20210824143418491" style="zoom: 33%;" />
+
+举个例子Intel的企业级SSD（P4510）就是接到 U.2接口上，走PCIE总线协议的支持NVME存储协议的SSD；
+
+> 对于PCIE，其包括 两个概念一个是PCIE通道，一个PCIE接口；可以在PCIE接口上通过转接口，转接成其他电气接口，比如U.2；也可以直接将具体的接口链接到PCIE通道上面；类似的SATA/SAS这两个总线协议也是。
+
+另外，我们通常说的SSD的存储介质都是NAND；Intel提出了一个新的介质叫3DXpoint，对应的产品就叫有常说的Optane SSD，还有AEP（Persistance Mem，因为是Intel内部代号叫AEP）。
+
+# SSD Introduction
+
+SSD主要有两个模块组成：Controller和Flash Chips；
+
+## Flash Chip
+
+各组Chip就是具体的存储介质，每组Chip与Controller之间通过Channel相连。每组Chip中有多个Die；Die就是具体的硅片，接到各自的引脚（pins）上，每个Die中又有多个Plane，Plane有自己的寄存器和cache，多个plane可以并发的读写（Interleaving）；
+
+各个Chip中的每个Plane中包含相同的Block，并且Block的编号区间相同；对于横跨多个Die中多个Plane的相同编号的Block，组成一个SuperBlock；每次Controler打开一个SuperBlock准备读写；同时Block又是GC擦除的单位。
+
+每个Block的其实又分为相同数量的Page，编号区间相同，那么在当前打开的SuperBlock中，相同编号的Page就叫SuperPage（就是每个Chip上位置相同的一块Page）；SuperPage又叫Stripe，大小是PageSize*ChipCount，SSD的WriteBuffer以此为单位进行Flush；由于Stripe中的page跨多个Chip，可见其中的Page可以并发写。每个page有128B用来存储元信息，其中包括该page的LBA，ECC等。
+
+<img src="/image/ssd/ssd-chip-layout.png" alt="image-20210902113857087" style="zoom:67%;" />
+
+在Latency上，读写都是 page到 plane register，然后register走channel；latency上可以这么理解：page->register < register->serial connection < reigister->page，因此Read < Write < GC（数量级上大概是 100us+ vs 300us vs 1ms +，这里有个大概的认识，肯定不绝对）。
+
+### Parallelism
+
+SSD划分成多个层级，其中在各个层级可能保证一定的并发，提高整体的吞吐；并发主要来自如下几个地方：
+
+- 多channel，同时可以接受多个Request（block layer、multi dist queue）
+- Ganging in flash package（多chip），处理multi-page request
+
+- interleaving：提高bandwidth
+- bg cleaning：理想情况下，gc在单独的idle die中进行，使用intra-plane copy back，不走内部总线；完全对前台无影响。
+
+## Controller
+
+Controller负责管理IO，Flash Chip目标是尽量避免后台的GC不影响前台IO，并且整体保持磨损均衡（wear-leaving）。对上层的最主要的功能就是完成LBA到PBA的转换，即FTL；
+
+<img src="/image/ssd/arch.png" alt="image-20210902105345838" style="zoom: 50%;" />
+
+Controller会在维护LBA -> PBA的同时，尽量避免后台的GC不影响前台IO，并且整体保持磨损均衡（wear-leaving），主要考虑一下几个方面进行Tradeoff：
+
+<img src="/image/linux-io/design-ssd.png" alt="image-20210823183420599" style="zoom:67%;" />
+
+大部分都比较直观，其中的Overprovisioning就是我们常说的SSD的OP区，这是用户不可见的预留空间，用来GC腾挪Block用的；Ganging表示将chip连接到同一个channel，这必然会影响并发。
+
+### GC
+
+值得一提的是GC对SSD性能的影响不可忽略。虽然我们常说SSD的随机写性能比传统HDD高，但是对于整盘来说，如果随机写过多，那么后台的GC压力就会很大，GC如果不走copy back，那么会占用SSD内部channel的带宽，影响整体的吞吐。
+
+GC的目标是提高cleaning efficiency，即每次移动最少的valid page，挑选垃圾率高的Block进行GC；对于要写入的Block，和一般Write类似要兼顾Wear leaving；一般在AllocationPool内部会维护free block list中选择，如果没有就需要腾挪位置，因此如果没有reserved block（OP），GC就会比较吃紧；另外如上文所说还会优先选择利用plane 内部的 copy -back。
+
+> 对于Wear-Leaving，就是确保盘中每个Page的擦写次数不能相差太大，每个厂商的策略不同，这里有个简单的策略，供读者进行简单的理解：
+>
+> - 首先维护每个block的age，确保每个block的age和平均值相差20%以内
+> - 写的时候，选在阈值之上作为目标block：
+>   - 但如果存在冷热的话，cold block因为有数据但是一直不更新，age就很大，hot data就不断写，知道掉出阈值后，只能不断recycle cold block才能确保负载均衡，这样recycle的时候，erasure的垃圾率很低；
+> - 总结
+>   - 识别code data block：跟踪元信息，并建立一个migration-candidate queue。
+>   - pick candidate write block：
+>     - 当pick出的candidate block，在retirementage（比如age remain lifetime的85%）之下，那么从migration-candidate queue取出一个cold block，将其中的数据转移到这个retire block；
+>     - 当没有retire block时，在avg age的波动区间内，按从1到0，通过概率的方式优先选阈值之上的。
+
+以上，笔者对SSD相关概念和机制进行了简单的梳理，希望对SSD有点困惑的人看完能够有个整体的认识。
+
+
+
+**Ref**
+
+[Design Tradeoffs for SSD Performance](https://www.usenix.org/legacy/events/usenix08/tech/full_papers/agrawal/agrawal.pdf)
+
+[How does this SSD store 8TB of Data? || Inside the Engineering of Solid-State Drive Architecture](https://www.youtube.com/watch?v=r-SivgEpA1Q&ab_channel=BranchEducation)
+
+[Error Characterization, Mitigation, and Recovery in Flash Memory Based Solid-State Drives](https://research.ece.cmu.edu/safari/pubs/1706.08642.pdf)
+

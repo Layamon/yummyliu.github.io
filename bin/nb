@@ -1,0 +1,35 @@
+# 创建一个新的博客文件，按照 yyyy-mm-dd-title.markdown创建
+
+#curDir="$(cd "$(dirname "$0")"; pwd)"
+
+curDir="/Users/liuyangming/layamon.github.io"
+postpath="${curDir}/_todoblog"
+if [ $# -lt 1 ]
+then
+    echo "missing blogname"
+    echo "usage: go \$blogname"
+    echo "e.g.: go 我的博文 tag1 tag2"
+    exit 1
+fi
+mydate=$(date +%Y-%m-%d | tr -d "\n") #Assign Output of Shell command to var
+mytime=$(date +%H:%M | tr -d "\n")
+blogname=$(echo $1)
+name=$(echo $mydate"-"$blogname".markdown")
+blogfile="${postpath}/${name}"
+touch $blogfile
+
+# 添加jekyll的文件头
+
+echo "---" > $blogfile
+echo "layout: post" >> $blogfile
+echo "title: $blogblogfile" >> $blogfile
+echo "date: $mydate $mytime" >> $blogfile
+echo "categories:" >> $blogfile
+echo "  -" >> $blogfile
+echo "typora-root-url: ../../layamon.github.io" >> $blogfile
+shift 1
+for i in $*; do
+echo "    - $i" >> $blogfile
+done
+echo "---" >> $blogfile
+

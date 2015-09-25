@@ -1,0 +1,33 @@
+---
+layout: post
+title: 
+date: 2020-05-16 08:23
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+场景：将字节流按照其中字节出现的频率进行二进制编码，即 byte_t->bitcode，bitcode是变长的且**保证某个bitcode与其他任何bitcode的前缀都不同**；出现频率越高的byte对应的bitcode越短。
+
+> uniquely decodable codes：
+
+str: "aabbacadb"
+
+编码
+
+1. 统计histogram：a(4) b(3) c(1) d(1)
+
+2. 建立编码表：a(0) b(10) c(110) d(111)
+3. 转换：“0,0,10,10,0,110,0,111,10”
+4. 解码：a a b b a c a d b
+
+那么可以看出来，编码表是需要存储的。
+
+---
+
+建立编码表的过程：
+
+维护一个优先队列，按照byte的频率由小到达排列；每次取出前两个
+
