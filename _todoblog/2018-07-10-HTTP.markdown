@@ -1,0 +1,32 @@
+---
+layout: post
+title: 
+date: 2018-07-10 08:08
+header-img: "img/head.jpg"
+categories: 
+  - network
+---
+
+> 早期的web是处理静态html的，后来有了CGI（Common Gateway Interface）开始动态生成HTML，直到演化到3P（ASP，PHP，JSP）等技术；以及现在的各种web引擎；这一切都是基于HTTP协议，写好一个web应用，HTTP必须要有所了解。
+
+# 1 HTTP请求
+
+## 1.1 请求方法
+
+### 1.1.1 安全的请求
+
+### 1.1.2 幂等的请求
+
+### 1.1.3 HTML中的请求方法
+
+## 1.2 请求首部
+
+# 2 HTTP响应
+
+## 2.1 响应状态码
+
+## 2.2 响应首部
+
+# 3 URI
+
+# 4 http/2 简述

@@ -1,0 +1,32 @@
+---
+layout: post
+title: SPDK
+date: 2021-06-18 15:27
+categories:
+  - SPDK
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+# DPDK
+
+
+
+# SPDK
+
+- NAND SSD：
+  - Operator：read/write/erase
+  - Layout：
+  - Limitation：
+  - Traditional vs Open-Channel：OC 没有 FTL模块，将内部的逻辑暴露给操作系统，更加灵活。
+
+- BlobStore：管理一整个SSD盘
+  - blob ：以Page为单位进行读写。
+    - cluster: 固定数量的连续的page，默认是1MB，即256个page。
+      - page : 一般是4kb。
+        - logical block：一般是512B或者4KB。
+
+BlobStore中有两类Meta，一个Global和perblob。每个Blob数据是Direct Write到磁盘，而perblob的meta是Cache，除非调用同步API；不过对于global meta，只有在proper shutdown的时候才会与磁盘进行同步，否则都是不持久化的。
+
+BlobStore数据的写入需要获得一个IOChannel，最好是一个thread一个channel。

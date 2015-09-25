@@ -1,0 +1,208 @@
+---
+layout: post
+title: CockroachDB简介(文档简译)
+subtitle: 难得有DB优先兼容PostgreSQL协议, 全球分布式数据库CockroachDB简介
+date: 2018-10-04 09:44
+categories: 
+    - Database
+    - CockroachDB
+---
+
+* TOC
+{:toc}
+
+
+CockroachDB是一个开源全球分布式的，可扩展且一致性的数据库。目前兼容PostgreSQL协议；[官方介绍](https://www.cockroachlabs.com/docs/stable/architecture/overview.html#glossary)
+
+# 设计目标
+
++ 使用简单：包括运维操作简单，用户定位问题方便；
++ 工业级的一致性：支持分布式事务，避免最终一致性带来的困扰和脏读等事务异常。
++ 极高可用性：任何节点可读可写，不发生冲突；
++ 部署灵活：部署不依赖任何平台或者产品；
++ 支持处理关系型数据的工具：比如SQL
+
+总结起来就是，用户能够方便的获得全球分布式的弹性DB云服务；
+
+## 术语
+
+| Term        | definition                                                   |
+| ----------- | ------------------------------------------------------------ |
+| Cluster     | 整个的CockroachDB的部署集群，逻辑上，是一个应用              |
+| Node        | CockroachDB中的一个机器                                      |
+| Range       | CockroachDB将**所有**table和index以及系统信息都存储在一个大的有序的kv映射表中 |
+| Replica     | 将每个range，存储大于等于三个副本，放在不同的node上          |
+| Leaseholder | 对于每个range，只有一个副本获得该range的lease（租赁权）；到达这个副本的读可以直接返回，写要与其他副本同步（向raft group leader提议，从而知道是否可以写）； |
+| Raft Leader | 一般就是leaseholder，对于写请求，要通过raft协议确认大部分replica同意后，才提交写； |
+| Raft Log    | 对于每个range，都有一个该range相关的replica同意的基于时间顺序的log；这个log就是每个replica的复制依据，保存在磁盘中。 |
+
+## 概念
+
+| Term                      | Definition                                                   |
+| ------------------------- | ------------------------------------------------------------ |
+| Consistency（数据一致）   | 在ACID和CAP理论中的C，虽然有所不同，但是主要意思就是保证你的数据是没有异常的； |
+| Consensus（意见共识）     | 当数据写入某个range时，法定数量（quorum）的node会同意并写入。 |
+| Replication               | 保证数据是有副本的，并且副本保持一致的；关于一致还取决于是Synchronous还是Aysnchronous。 |
+| Transactions              | 满足事务的ACID特性的DB，能够让用户更加放心。                 |
+| Multi-Active Availability | 基于共识（Consensus）的HA，允许每个节点处理range中的一个subset的数据。和这个相对应的有active-passive replication（active处理全部请求），active-active replication（所有node都能处理请求，但是不保证读的是最新数据）。 |
+
+# 系统概述
+
+ 各个node的功能是相同的，所以用户可以通过SQL API连接到任一node上操作；这种特性使得CRDB（CockroachDB简称）容易和LoadBalancer配合。
+
+收到SQL的RPC请求之后，node将请求分解为分布式kv存储的操作。数据的不断插入，CRDB将其分割为64MB大小的range，这些range分布在不同的node上，每个至少有3个副本。
+
+node收到读写请求后，首先要找到能处理这个请求的node；本node并不需要知道如何找到目标node，CRDB会去追溯，这使得每个node都是相同的功能。
+
+基于共识算法，保证每次更改是在大多数node同意的情况下提交的。同样也保证了隔离性，确保应用读的一致性。
+
+XXX? 最后，数据存储在一个有效的存储引擎中，确保能够追溯数据的时间戳。有个这个功能，就可以支持SQL标准中的`AS OF STSTEM TIME`，找到一段时间之前的历史数据。
+
+总之，整体结构就是使用将SQL语句，解析为KV操作处理并返回，其包括以下几层，层与层之间完全是黑盒子。
+
+| Order | layer         | purpose                                         |
+| ----- | ------------- | ----------------------------------------------- |
+| 1     | SQL           | 将SQL解析为kv操作                               |
+| 2     | Transactional | 原子性的操作KV条目                              |
+| 3     | Distribution  | 将冗余的KV range向上表现为一个                  |
+| 4     | Replication   | 多node之间的一致与同步。通过lease确保一致性读。 |
+| 5     | Storage       | 从磁盘上读写数据。                              |
+
+# SQL层
+
+## SQL层概述
+
+对外提供SQL API，将SQL请求，转换成KV操作，发到下一层Transactional（主要是将planNodes发送到Transaction layer）。
+
+## SQL组件
+
+该层主要有以下几个组件：
+
++ Relational Structure
++ SQL API
++ PostgreSQL wire protocol
++ SQL parser，planner，executor
++ Encoding
++ DistSQL
+
+# Transactional层
+
+## 事务概述
+
+CRDB最看重DB的一致性特性。这是数据库可依赖的重要条件，否则会出很多奇怪的异常。
+
+CRDB支持完全的ACID特性，并且每条语句一个事务，都是autocommit的。
+
+事务是cross-range/cross-table的，通过两阶段提交协议确保正确性。
+
+### 阶段1：读写
+
+得到写请求后，首先创建两个对象：
+
+1. 事务记录（Transaction record）：存储在第一次写发生的range中，并记录事务当前的状态（启动时为PENDING，结束时为COMMITTED或ABORTED）。
+2. 写意向（Write intents）：代表临时未提交的状态，和MVCC概念类似。创建写意向后，CRDB检查是否存在事务冲突，冲突就restart当前事务。如果事务由于其他原因结束（比如违反约束），就aborted。
+
+### 阶段2：提交
+
+检查running的事务，确认这些事务是不是已经`ABORTED`，是的话，就重做这个事务；
+
+如果事务通过了检查，那么状态就是`COMMITED`。
+
+### 阶段3：清理
+
+当事务结束后，coordinator节点将MVCC中的写意向清理掉；（写意向用来检查事务之间的冲突，清理操作的一个优化点是：清理操作可以在检查事务记录的任何时间执行，避免统一执行）。
+
+
+
+## 事务标识
+
+> distributed problem: ordering & causality
+
+### HLC
+
+在分布式环境中，顺序性和因果性是很关键的问题；在CRDB中，基于*Logical Physical Clocks
+and Consistent Snapshots in Globally Distributed Databases*实现的混合逻辑时钟解决这些问题。对于事务来说，每个事务开始是获取一个HLCtime，用在数据的版本和事务隔离中。
+
+### 时钟同步
+
+通过[NTP](http://www.ntp.org/)协议或者其他时钟同步中间件来确保时间在一定的偏离（Max clock offset enforcement）里是同步的；否则就会出现一些序列化异常，如stale read和write skew。
+
+# Distribution层
+
+CRDB将集群中的**所有数据**存储在一整个sorted_map中，并将整个key-space划分为若干个range；因此，每个key都能在一个range中发现。有了这个大的sortedmap，CRDB可以实现快速定位于高效扫描。
+
+### SortedMap结构
+
+#### 元数据
+
+> system data
+
+位于meta range中，是一个两层的索引；第一层叫meta1，第二层叫meta2；每个node都知道meta1的位置，通过meta1找到meta2，从而找到具体数据的位置。
+
+meta range和普通range的存储方式相同；
+
+#### 表数据
+
+> user data
+
+每个表都是一个有序的一级索引，同时表上还有相应的二级索引；每个表以及相应的二级索引一开始**都对应一个**range，range中的每个kv对，要么是表中或者二级索引中的一行元组。
+
+当range到达64MB后，将进行分裂成多个range。之后，可能表和索引的数据将会分开存储，也可能还在一起。
+
+默认的64MB，确保多节点通信的效率；如果数据访问的局部性比较好，可以设置的大一点。同样地，每个range都有一个Replica。
+
+### SortedMap操作
+
+对于每个SortedMap的数据请求，通过比较meta2的key找到具体数据的位置；meta2在节点之间是有缓存的，并且缓存很大，确保大部分的route查询可以命中缓存。
+
+如果从meta2缓存中，找到了数据的range的leaseholder。那么将请求转发过去；如果，转发过去发现没有相应的数据，那么更新缓存。
+
+# Replication层
+
+> 基于一致性算法，实现多个node上的copy的一致性。
+
+CRDB实现的是强一致性（C），当出现节点失效时，为了保证分区容忍性（P），CRDB自动停止失效节点的处理，并进行数据重新分布（rebalance）。同样地，如果加入了新的节点，同样要进行数据重新分布。
+
+### Raft
+
+数据的序列化一致性是基于Raft协议实现的。对于每个range的多个replica，将其组织在一个Raft Group中。Group中的每个replica要么是leader（leader一般也就是leaseholder），要么是follower，leader和follower之间维护了心跳链接，如果follower很久没有收到leader的心跳，那么就会变成candidate，进行重新选举。
+
+每个node收到的`BatchRequest`会将其转换成raft command，并发送到leader节点，leader决定是否可以写入，可以的话将其写在RaftLog中。
+
+有了RaftLog，失效的节点就可以恢复了，落后的节点就可以追溯了。
+
+### Snapshot
+
+在rebalance时，复制一个新的replica，可以复制一个数据的快照。后续根据raft log进行追溯。
+
+### Lease
+
+每个range对应一个raftgroup，其中只有一个节点是leaseholder。对于读，leaseholder可以直接跳过raft协议，写的话leaseholder和raft group leader需要进行确认，为了避免这个开销，往往这两个角色是一个节点。
+
+对于用户数据采用`Epoch-based leases`，对于系统数据采用`Expiration-based leases`。
+
+### rebalance
+
+节点的add/del都会触发rebalance，rebalance是从leaseholder处，复制一个数据的snapshot。当复制结束后，该节点就会加入到raft group中，加入后发现自己的数据版本太旧，就会根据raft log进行追溯。
+
+# Storage层
+
+每个节点启动的时候都要指定自己的`store`，这个store就是RocksDB。对于节点上的数据需要有三个RocksDB实例分别存储三种不同的数据，三种数据共享一个缓存：
+
+1. Raft Log
+2. 分布式SQL的临时数据
+3. 其他数据
+
+每个range的多个副本不会放在同一个store中。
+
+### RocksDB
+
+KV存储引擎支持批量原子写和快照功能。通过前缀压缩，实现高效的Key存储。
+
+### MVCC
+
+​	Storage层的MVCC值，确保了CRDB的tranaction层的数据一致性。比如，CRDB保存了一个timestamp cache，其中记录了key被读取的最新timestamp，如果有晚于该时间戳的write，那么该write事务进行restart。
+
+### 垃圾回收
+
+可以设置集群，数据库以及表级别的垃圾回收，避免磁盘数据垃圾太多，默认是24小时一次。

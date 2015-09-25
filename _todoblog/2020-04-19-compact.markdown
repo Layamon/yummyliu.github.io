@@ -1,0 +1,59 @@
+---
+layout: post
+title: 
+date: 2020-04-19 14:46
+categories:
+  -
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+
+
+compaction分为几个模块：
+
++ CompactionJob：
++ CompactionIterator：
++ CompactionPicker：
+
+引用关系：
+
+CompactionJob
+
+​	SubcompactionState 
+
+​		CompactionIterator
+
+CompactionPicker
+
+​	LevelCompactionPicker
+
+执行：
+
+在SchedulePendingCompaction中，判断是否有compact需要执行，调用compactionPicker的NeedsCompaction；
+
+根据我们配置的策略，比如LevelCompactionPicker；那么，LevelCompactionPicker根据提前计算好的分数返回是否需要compact；
+
+在ComputeCompactionScore中，根据配置的compaction_style_计算分数；
+
+最后基于PickCompaction，返回一个Compact；如果选定一个CompactionJob，
+
+MaybeScheduleFlushOrCompaction
+
+​	-> BackgroundCompaction
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

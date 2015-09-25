@@ -1,0 +1,109 @@
+---
+layout: post
+title: KMP回顾
+date: 2019-02-04 07:55
+header-img: "img/head.jpg"
+categories: 
+  - algo
+typora-root-url: ../../layamon.github.io
+---
+* TOC
+{:toc}
+# 背景
+
+在计算机系统中，字符串操作是相当常见的。而字符串操作中，我们最常见的操作就是字符串匹配，即，我们有一个很长的文本**S**和一个模式串**P**，需要找到S中是否存在P的匹配，有的话就返回匹配的位置。显而易见的做法如下：
+
+```python
+for i in range(len(S)):
+  j=0
+  ii = i
+  while j<len(P) and ii < len(S) ans S[ii] == P[j]:
+    j+=1
+    ii+=1
+  if j==N:
+    return i-len(P)
+return -1 # 没找到	
+```
+
+该方法对于S的每个位置都会向后遍历len(P)的距离，判断该位置是否是匹配的；因此，算法复杂度为O(len(S)*len(P))。进一步思考，即使P[k]没有匹配，但是`(P[j]==S[i] j<k)`，那么我们可以利用这一条件减少算法的重复比较，即：
+
+# kmpSearch
+
+假设对于P来说，有`P[j-k],…,P[j] == P[0],…,P[k]`；那么当P[j+1] != S[i]时，i不动，j=k（不必退回0）。i假设我们已知了满足如上条件的的每个位置的k，即，有数组nxt；则上述算法变成：
+
+```python
+#! /usr/local/bin/python3.7
+
+
+def kmpSearch(S, P):
+    nxt = getNxt(P)
+    j=0
+    i=0
+    while i<len(S):
+        if j<len(P) and i<len(S) and P[j] == S[i]:
+            i+=1
+            j+=1
+        elif j<len(P) and i<len(S) and P[j] != S[i]:
+            if j==0:
+                i+=1
+            else:
+                j = nxt[j-1]+1
+
+        if j == len(P):
+            return i-len(P)
+    return -1
+
+print(kmpSearch("ABABDABACDABABCABAB", "ABABCABAB"))
+```
+
+最后问题就是如何找到getNxt。
+
+# Next数组
+
+基于`P[j-k],…,P[j] == P[0],…,P[k]`成立，那么`nxt[j-k],…,nxt[j] = 0,…,k`。初始化两个一前一后的指针，如果前后两个元素不相等，那么前者迭代；直到找到P中前后相同的元素作为起点，那么对于前后相等的船有nxt[j] = i；否则，i=nxt[i-1]+1。即，最后有：
+
+```python
+#! /usr/local/bin/python3.7
+
+
+def kmpSearch(S, P):
+
+    def getNxt(P):
+        nxt=[-1 for i in range(len(P))]
+        j=1
+        i=0
+        while j<len(P):
+            if P[j] == P[i]:
+                nxt[j] = i
+                j+=1
+                i+=1
+            elif i==0:
+                j+=1
+            else:
+                i=nxt[i-1]+1
+        return nxt
+
+
+
+    nxt = getNxt(P)
+    j=0
+    i=0
+    while i<len(S):
+        if j<len(P) and i<len(S) and P[j] == S[i]:
+            i+=1
+            j+=1
+        elif j<len(P) and i<len(S) and P[j] != S[i]:
+            if j==0:
+                i+=1
+            else:
+                j = nxt[j-1]+1
+
+        if j == len(P):
+            return i-len(P)
+    return -1
+
+print(kmpSearch("ABABDABACDABABCABAB", "ABABCABAB"))
+```
+
+
+

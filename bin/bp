@@ -1,0 +1,12 @@
+# update
+jekyll clean
+if [ $# != 1 ]
+then
+    echo "missing commitlog"
+    echo "usage: og \$commitlog"
+    echo "e.g.: og 我的博文"
+    exit 1
+fi
+git add .
+git commit -m "$1"
+git push origin master

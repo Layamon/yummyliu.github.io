@@ -1,0 +1,15 @@
+
+mainmenu:
+  home:
+    url: "/"
+    text: "Archive"
+    icon_class: "fa-archive"
+    #  tags:
+    #      url: "/tags/"
+    #      text: "Tags"
+    #      icon_class: "fa-tags"
+  aboutme:
+    url: "/about/"
+    text: "AboutMe"
+    icon_class: "fa-id-card-o"
+

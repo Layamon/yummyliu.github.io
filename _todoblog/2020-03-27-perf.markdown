@@ -1,0 +1,110 @@
+---
+layout: post
+title: Perf工具
+date: 2020-03-27 13:34
+categories:
+  - Linux
+typora-root-url: ../../layamon.github.io
+---
+> * TOC
+{:toc}
+
+
+
+Performance Events for Linux, called “PERF,” is the standard profiling infrastructure on Linux. Perf uses hardware (PMU) to assist its recording work,
+
+子系统：
+
++ SYSCALL：访问OS内核event和硬件event的数据，对硬件数据的统计支持counting-mode和sampling-mode。
++ User-space tools：对性能数据的收集、展示和分析。
+
+在Linux3.6.11后，将Perf绑定在内核代码中了，成为标准的分析工具。
+
+```bash
+sudo apt-get install linux-tools
+```
+
+以上我们知道，perf是收集各种event数据进行分析，共有哪些event呢？`perf list`会列出来。
+
+主要分为SoftWare和HardWare，另外还有些其他组件，比如Kernel PMU event等
+
++ hardware event举例
+
+  ```
+  cpu-cycles OR cycles
+  instructions
+  cache-references
+  cache-misses
+  branch-instructions OR branches
+  branch-misses
+  bus-cycles
+  stalled-cycles-frontend OR idle-cycles-frontend
+  stalled-cycles-backend OR idle-cycles-backend
+  ref-cycles
+  ```
+
++ software event举例
+
+  ```
+  cpu-clock
+  task-clock
+  page-faults OR faults
+  context-switches OR cs
+  cpu-migrations OR migrations
+  minor-faults
+  major-faults
+  alignment-faults
+  emulation-faults
+  ```
+
+通常我们关注比较多的就是software event级别。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+https://www.thegeekdiary.com/understanding-proc-meminfo-file-analyzing-memory-utilization-in-linux/
+
+
+
+
+
+
+
+
+
+**Cached** is the size of the page cache. **Buffers** is the size of in-memory block I/O buffers. **Cached** matters; **Buffers** is largely irrelevant.
+
+https://www.quora.com/What-is-the-difference-between-Buffers-and-Cached-columns-in-proc-meminfo-output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**Reference** 
+
+https://perf.wiki.kernel.org/index.php/Tutorial#Sampling_with_perf_record
+
+https://www.percona.com/community-blog/2020/02/05/finding-mysql-scaling-problems-using-perf/
