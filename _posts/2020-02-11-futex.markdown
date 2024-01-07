@@ -78,7 +78,7 @@ memory barrier有两个作用：防止指令乱序、确保数据可见；这里
 
 比如，为了防止指令乱序，当插入sfence指令后，sfence之前的store指令都不会重排到sfence之后，并且如果，在执行sfence的时刻，store buffer中有store指令，那么会将store buffer挤干（drain）确保数据可见；为了保证数据的可见性，这里会和cache coherence协议发生联动；
 
-其实也不需要对cache coherence有特别细节的了解；这里只需要知道，在cache coherence协议中，一个core对cacheline发生的写操作，那么会向其他core发送invalid Request；其他core收到invalid Request后，将cacheline标记为invalid后，会去内存读；这样保证了不同core不会读取到脏的内存数据。为了优化invalid这个操作，在x86 arch中，增加了Store buffer和Invalid queue的组件。此时，若当前CPU向其他CPU发了invalid Request，会在自己的StoreBuffer会存下此时的store指令；其他CPU收到invalid Request，先放到自己的invalid queue中，之后异步的将自己的cache line置invalid。当有这两个结构后，CPU读数据，会先读自己的store buffer，然后才是cacheline；其他CPU则不会得知此次修改，且由于cacheline的invalid是异步的，那么可能会极短的时间内会读到脏数据。
+其实也不需要对cache coherence有特别细节的了解；这里只需要知道，在cache coherence协议中，一个core对cacheline发生的写操作，那么会向其他core发送invalid Request；其他core收到invalid Request后，将cacheline标记为invalid后，会去内存读；这样保证了不同core不会读取到脏的内存数据。为了优化invalid这个操作，在x86 arch中，增加了Store buffer和Invalid queue的组件。此时，若当前CPU在自己的storebuffer中修改了某个cacheline，会向其他CPU发invalid Request；其他CPU收到invalid Request，先放到自己的invalid queue中，之后异步的将自己的cache line置invalid。当有这两个结构后，CPU读数据，会先读自己的store buffer，然后才是cacheline；其他CPU则不会得知此次修改，且由于cacheline的invalid是异步的，那么可能会极短的时间其他内会读到脏数据。
 
 <img src="https://www.researchgate.net/profile/Paul-Mckenney/publication/228824849/figure/fig5/AS:340743597117461@1458251012239/Caches-With-Invalidate-Queues.png" alt="https://www.researchgate.net/profile/Paul-Mckenney/publication/228824849/figure/fig5/AS:340743597117461@1458251012239/Caches-With-Invalidate-Queues.png" style="zoom:50%;" />
 
@@ -99,7 +99,37 @@ memory barrier有两个作用：防止指令乱序、确保数据可见；这里
 + `memory_order_consume`：本线程中，后续与**本原子变量相关**的读写操作，必须在本指令完成后执行；
 + `memory_order_seq_cst`：全部读写都按顺序执行，默认值，即保持Sequential Consistency；
 
-一般通过多个原子操作上配置上不同的barrier，就得到了我们想要的多线程间的内存存取的语义，主要的有以下四种，**release-acquire内存模型**：`memory_order_acquire`和`memory_order_release`经常结合使用，这种内存顺序不仅限于原子内存访问指令，包括普通内存访问指令；**release-consume内存模型**：`memory_order_consume`是`memory_order_acquire`的更加弱化版本，`memory_order_release`和`memory_order_consume`可以建立关于**某原子变量**的生产者-消费者顺序；**松散内存模型**：`memory_order_relaxed`只保证原子变量访问的互斥即可。**顺序一致型内存模型**，默认的完全保序模型。MySQL 8.0 中，对log模块的重构包括了无锁日志缓冲区，其中就通过`atomic_thread_fence`进行内存顺序的保证，比如在[log_buffer_close](https://github.com/percona/percona-server/blob/e7aa737eb58815a1c21db315e2cfdfb008b4355a/storage/innobase/log/log0buf.cc#L1111)的时候，通过`memory_order_release`确保了在`logbufferclose`提交lsn时，lsn已经被正确的更新了。除了通过`atomic_thread_fence`来指定之外，也可在原子变量的成员函数上附加barrier信息来达到barrier的效果，比如[RocksDB的skiplist的SetNext](https://github.com/facebook/rocksdb/blob/01bd86ad356a69ab54783aaaa198b6faa5684fb1/memtable/skiplist.h?_pjax=%23js-repo-pjax-container%2C%20div%5Bitemtype%3D%22http%3A%2F%2Fschema.org%2FSoftwareSourceCode%22%5D%20main%2C%20%5Bdata-pjax-container%5D#L479)也采用了release的barrier，当插入一个新节点x的时候，应确保x的next已经正确的更新了。而x的更新则只需采用relaxed，保证互斥即可。
+一般通过多个原子操作上配置上不同的barrier，就得到了我们想要的多线程间的内存存取的语义，主要的有以下四种：
+
+- **release-acquire内存模型**：`memory_order_acquire`和`memory_order_release`经常结合使用，这种内存顺序不仅限于原子内存访问指令，包括普通内存访问指令；比较经典的一个例子就是解决cpp中[Singleton的DoubleLockChecking的问题](https://preshing.com/20130930/double-checked-locking-is-fixed-in-cpp11/)。
+- **release-consume内存模型**：`memory_order_consume`是`memory_order_acquire`的更加弱化版本，`memory_order_release`和`memory_order_consume`可以建立关于**某原子变量**的生产者-消费者顺序；
+- **松散内存模型**：`memory_order_relaxed`只保证原子变量访问的互斥即可。
+- **顺序一致型内存模型**，默认的完全保序模型。
+
+举几个自己碰到的例子：
+
+- MySQL 8.0 中，对log模块的重构包括了无锁日志缓冲区，其中就通过`atomic_thread_fence`进行内存顺序的保证，比如在[log_buffer_close](https://github.com/percona/percona-server/blob/e7aa737eb58815a1c21db315e2cfdfb008b4355a/storage/innobase/log/log0buf.cc#L1111)的时候，通过`memory_order_release`确保了在`logbufferclose`提交lsn时，lsn已经被正确的更新了。
+
+- 除了通过`atomic_thread_fence`来指定之外，也可在原子变量的成员函数上附加barrier信息来达到barrier的效果，这种基于atomic_flag可用来构建上面某种内存模型，比如[RocksDB的skiplist的SetNext](https://github.com/facebook/rocksdb/blob/01bd86ad356a69ab54783aaaa198b6faa5684fb1/memtable/skiplist.h#L173C1-L186C4)构建了release-acquire内存模型；当插入一个新节点x的时候，由于有**release-barrier**，next_[n]更新的时候storebuffer会强制flush到cache中；此时cache的mesi协议会向其他cache发送invalid消息；invalid queue中的消息是异步apply的，不过当其他core的读操作遇到**acquire-barrier**时，会先把invalidqueue消费完再读cache；这样其他cache的内存状态也确保是准确的；在RocksDB中有时候只需采用relaxed，同样提供了Nobarrier_setNext保证互斥即可，根据不同场景取用。
+
+  ```cpp
+    // Accessors/mutators for links.  Wrapped in methods so we can
+    // add the appropriate barriers as necessary.
+    Node* Next(int n) {
+      assert(n >= 0);
+      // Use an 'acquire load' so that we observe a fully initialized
+      // version of the returned Node.
+      return (next_[n].load(std::memory_order_acquire));
+    }
+    void SetNext(int n, Node* x) {
+      assert(n >= 0);
+      // Use a 'release store' so that anybody who reads through this
+      // pointer observes a fully initialized version of the inserted node.
+      next_[n].store(x, std::memory_order_release);
+    }
+  ```
+
+  
 
 因此C++ 11中，程序员只需要理解了上述memory order的定义，那么不需要深陷在架构具体细节，可以专注在自身的逻辑中。
 
